@@ -3,7 +3,8 @@
 Telegram AI Bot - Python + Upstash Redis (100% Safe & Stable)
 Configured for: bot-hosting.net (Docker / NAT Environment)
 Features:
-- Flexible Group Trigger (Supports 'ربات', 'روبات', 'بات' with any punctuation)
+- Group Moderation Suite (Mute, Timed-Mute, Unmute, Ban, Delete) for Admins
+- Flexible Group AI Trigger ('ربات <پیام>' or direct reply)
 - Complete Image Model Editor (Full Wizard Flow)
 - Guaranteed Group & Private File-Only Code Delivery (.py, .js, .html, .cpp, .txt)
 - Anti-Clutter: No long code dumps in group or private chats
@@ -28,6 +29,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import telebot
 from telebot import types
+from telebot.types import ChatPermissions
 from telebot.apihelper import ApiTelegramException
 
 # ==========================================
@@ -932,7 +934,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             pass
 
 # ==========================================
-# ۵. هندلر پیام‌ها و رویدادهای تلگرام (تشخیص منعطف کلمه ربات)
+# ۵. هندلر پیام‌ها و رویدادهای تلگرام (دستورات مدیریتی گروه + چت هوش مصنوعی)
 # ==========================================
 @bot.message_handler(content_types=['text', 'photo', 'document', 'video', 'audio', 'voice'])
 def handle_all_messages(msg):
@@ -963,6 +965,7 @@ def handle_all_messages(msg):
         bot.send_message(chat_id, "⛔ حساب شما توسط مدیریت مسدود شده است.", message_thread_id=thread_id)
         return
 
+    # دستورات چت خصوصی ادمین
     if not is_group:
         admin_step = safe_kv_get(f"ADMIN_STEP_{user_id}")
         if admin_step and user_id == ADMIN_ID:
@@ -1022,6 +1025,74 @@ def handle_all_messages(msg):
         bot_id = str(bot_info.id)
         lower_text = text.lower().strip()
 
+        # ==========================================
+        # 👮 دستورات ناظمی و مدیریتی گروه ویژه ادمین‌ها
+        # ==========================================
+        if is_group_admin(chat_id, user_id) and msg.reply_to_message:
+            target_user = msg.reply_to_message.from_user
+            target_uid = target_user.id
+            target_name = target_user.first_name or "کاربر"
+
+            # ۱. سکوت / بی‌صدا کردن (دائمی یا زمان‌دار: مثلاً "سکوت" یا "سکوت 10")
+            if lower_text.startswith("سکوت") or lower_text.startswith("بی صدا") or lower_text.startswith("/mute"):
+                # استخراج زمان در صورت تعیین شدن (مثلاً "سکوت 15" برای ۱۵ دقیقه)
+                minutes = 0
+                match_num = re.search(r'\d+', lower_text)
+                if match_num:
+                    minutes = int(match_num.group())
+
+                until_date = int(time.time() + minutes * 60) if minutes > 0 else 0
+
+                try:
+                    bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=target_uid,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=until_date
+                    )
+                    time_msg = f"به مدت **{minutes} دقیقه**" if minutes > 0 else "**به صورت دائم**"
+                    bot.reply_to(msg, f"🔇 کاربر [{target_name}](tg://user?id={target_uid}) {time_msg} در گروه بی‌صدا شد.", parse_mode="Markdown")
+                except Exception as e:
+                    bot.reply_to(msg, f"❌ خطای محدودسازی: دسترسی ادمینی ربات را در گروه بررسی کنید.")
+                return
+
+            # ۲. رفع سکوت
+            elif lower_text in ["رفع سکوت", "ازاد", "آزاد", "/unmute"]:
+                try:
+                    bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=target_uid,
+                        permissions=ChatPermissions(
+                            can_send_messages=True,
+                            can_send_media_messages=True,
+                            can_send_other_messages=True,
+                            can_add_web_page_previews=True
+                        )
+                    )
+                    bot.reply_to(msg, f"🔊 سکوت کاربر [{target_name}](tg://user?id={target_uid}) برداشته شد و می‌تواند پیام بفرستد.", parse_mode="Markdown")
+                except Exception:
+                    bot.reply_to(msg, "❌ خطا در رفع محدودیت.")
+                return
+
+            # ۳. اخراج / بن کاربر
+            elif lower_text in ["اخراج", "بن", "بلاک", "/ban", "/kick"]:
+                try:
+                    bot.ban_chat_member(chat_id, target_uid)
+                    bot.reply_to(msg, f"🚫 کاربر [{target_name}](tg://user?id={target_uid}) از گروه اخراج شد.", parse_mode="Markdown")
+                except Exception:
+                    bot.reply_to(msg, "❌ خطا در اخراج کاربر (ربات نمی‌تواند ادمین‌ها را اخراج کند).")
+                return
+
+            # ۴. حذف پیام
+            elif lower_text in ["حذف", "پاک", "دلیت", "/del"]:
+                try:
+                    bot.delete_message(chat_id, msg.reply_to_message.message_id)
+                    bot.delete_message(chat_id, msg.message_id)
+                except Exception:
+                    pass
+                return
+
+        # دستورات وضعیت آنلاین و سکوت کلی ربات در گروه
         admin_cmds = ["/bot", "bot", "/bot test", "bot test", "/bot سکوت", "bot سکوت", "/bot صحبت", "bot صحبت", "/bot راهنما", "bot راهنما"]
         if any(lower_text == c or lower_text.startswith(c + " ") for c in admin_cmds):
             if not is_group_admin(chat_id, user_id):
@@ -1046,7 +1117,11 @@ def handle_all_messages(msg):
                     "🔹 `/bot test` ➔ بررسی وضعیت آنلاین بودن ربات\n"
                     "🔹 `/bot سکوت` ➔ متوقف کردن موقت پاسخگویی ربات\n"
                     "🔹 `/bot صحبت` ➔ فعال‌سازی مجدد ربات در گروه\n\n"
-                    "💡 *نکته:* این دستورات صرفاً توسط ادمین‌ها قابل اجرا هستند."
+                    "👮 **دستورات ناظمی (ریپلای روی پیام کاربر):**\n"
+                    "🔸 `سکوت` یا `سکوت 10` ➔ بی‌صدا کردن کاربر\n"
+                    "🔸 `رفع سکوت` یا `آزاد` ➔ لغو محدودیت کاربر\n"
+                    "🔸 `اخراج` یا `بن` ➔ اخراج کاربر از گروه\n"
+                    "🔸 `حذف` ➔ پاک کردن پیام متخلف"
                 )
                 bot.reply_to(msg, help_text, parse_mode="Markdown", allow_sending_without_reply=True)
                 return
@@ -1056,12 +1131,11 @@ def handle_all_messages(msg):
 
         is_reply_to_bot = msg.reply_to_message and str(msg.reply_to_message.from_user.id) == bot_id
 
-        # الگوی هوشمند برای تشخیص انواع نگارش: "ربات"، "روبات"، "بات" با فاصله، دو نقطه، ویرگول یا خط بعد
+        # الگوی هوشمند برای تشخیص انواع نگارش کلمه "ربات"، "روبات" یا "بات"
         robot_pattern = r'^(ربات|روبات|بات)[\s:,،\n]+(.*)$'
         robot_match = re.match(robot_pattern, text.strip(), flags=re.IGNORECASE | re.DOTALL)
         is_exact_robot_call = text.strip() in ["ربات", "روبات", "بات"]
 
-        # اگر پیام ریپلای به ربات نبود و با کلمه "ربات" هم شروع نشده بود، کاملاً نادیده گرفته شود
         if not is_reply_to_bot and not robot_match and not is_exact_robot_call:
             return
 
@@ -1070,7 +1144,6 @@ def handle_all_messages(msg):
         elif is_exact_robot_call:
             text = "سلام! در خدمتم، چطور می‌تونم کمکت کنم؟"
 
-        # پاسخ به پیام ریپلای‌شده کاربر دیگر در صورت صدا زدن ربات
         if msg.reply_to_message and str(msg.reply_to_message.from_user.id) != bot_id:
             target_user = msg.reply_to_message.from_user
             target_name = target_user.first_name or "کاربر"
@@ -1447,7 +1520,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
 # ==========================================
 if __name__ == "__main__":
     print("=" * 45)
-    print("🤖 Neo-AI-Bot with Smart Persian Trigger Started")
+    print("🤖 Neo-AI-Bot with Group Moderation Suite Started")
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | SSE Streaming Active")
     print("=" * 45)
