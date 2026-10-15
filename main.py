@@ -3,6 +3,8 @@
 Telegram AI Bot - Python + Upstash Redis (100% Safe & Stable)
 Configured for: bot-hosting.net (Docker / NAT Environment)
 Features:
+- Flexible Group Trigger (Supports 'ربات', 'روبات', 'بات' with any punctuation)
+- Complete Image Model Editor (Full Wizard Flow)
 - Guaranteed Group & Private File-Only Code Delivery (.py, .js, .html, .cpp, .txt)
 - Anti-Clutter: No long code dumps in group or private chats
 - Strict UTF-8 Streaming Engine (No Mojibake)
@@ -321,7 +323,7 @@ def process_code_and_text(raw_text, is_code_prompt):
     return raw_text, []
 
 # ==========================================
-# 📤 تابع تضمینی ارسال فایل در گروه و پیوی (اصلاح باگ آرگومان)
+# 📤 تابع تضمینی ارسال فایل در گروه و پیوی
 # ==========================================
 def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None, thread_id=None):
     caption = f"📁 فایل سورس کد ({ext.upper()}): {filename}"
@@ -332,7 +334,6 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         b.seek(0)
         return b
 
-    # تلاش اول: ارسال با ریپلای و بدون باگ نام پارامتر
     try:
         kwargs = {"caption": caption}
         if reply_to_id:
@@ -341,11 +342,9 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         if thread_id:
             kwargs["message_thread_id"] = thread_id
 
-        # ارسال به صورت پوزیشنال (chat_id, data) برای حل قطعی ارور pyTelegramBotAPI
         bot.send_document(chat_id, make_bio(), **kwargs)
         return True
     except TypeError:
-        # در صورتی که نسخه telebot آرگومان allow_sending_without_reply را نداشت
         try:
             bot.send_document(chat_id, make_bio(), caption=caption, reply_to_message_id=reply_to_id)
             return True
@@ -354,7 +353,6 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
     except Exception as e1:
         print(f"[Document Send Error 1]: {e1}")
 
-    # تلاش دوم: ارسال مستقیم به چت گروه در صورت رد شدن ریپلای توسط تلگرام
     try:
         kwargs2 = {"caption": caption}
         if thread_id:
@@ -817,10 +815,10 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         else:
             final_text = clean_text
 
-        # ۱. ارسال متن تمیز
+        # ۱. ارسال متن تمیز خلاصه در گروه یا پیوی
         send_safe_ai_response(chat_id, status_msg_id, final_text, reply_to, thread_id)
         
-        # ۲. ارسال تضمینی و قطعی فایل در همان گروه یا پی‌وی
+        # ۲. ارسال سورس کد فقط و فقط در قالب فایل دانلودی در همان چت
         for filename, byte_data, ext in code_files:
             send_code_document_safe(
                 chat_id=chat_id,
@@ -934,7 +932,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             pass
 
 # ==========================================
-# ۵. هندلر پیام‌ها و رویدادهای تلگرام
+# ۵. هندلر پیام‌ها و رویدادهای تلگرام (تشخیص منعطف کلمه ربات)
 # ==========================================
 @bot.message_handler(content_types=['text', 'photo', 'document', 'video', 'audio', 'voice'])
 def handle_all_messages(msg):
@@ -1021,7 +1019,6 @@ def handle_all_messages(msg):
     target_reply_id = msg.message_id
     if is_group:
         bot_info = bot.get_me()
-        bot_username = f"@{bot_info.username.lower()}"
         bot_id = str(bot_info.id)
         lower_text = text.lower().strip()
 
@@ -1058,30 +1055,22 @@ def handle_all_messages(msg):
             return
 
         is_reply_to_bot = msg.reply_to_message and str(msg.reply_to_message.from_user.id) == bot_id
-        is_mentioned = False
 
-        if msg.entities:
-            for ent in msg.entities:
-                if ent.type in ["mention", "text_mention"]:
-                    mention_val = text[ent.offset:ent.offset + ent.length].lower()
-                    if mention_val == bot_username:
-                        is_mentioned = True
+        # الگوی هوشمند برای تشخیص انواع نگارش: "ربات"، "روبات"، "بات" با فاصله، دو نقطه، ویرگول یا خط بعد
+        robot_pattern = r'^(ربات|روبات|بات)[\s:,،\n]+(.*)$'
+        robot_match = re.match(robot_pattern, text.strip(), flags=re.IGNORECASE | re.DOTALL)
+        is_exact_robot_call = text.strip() in ["ربات", "روبات", "بات"]
 
-        if bot_username in lower_text:
-            is_mentioned = True
-
-        call_prefixes = ["bot", "ai", "ربات", "پاسخ"]
-        starts_prefix = any(lower_text == p or lower_text.startswith(p + " ") or lower_text.startswith(p + "\n") for p in call_prefixes)
-
-        if not is_reply_to_bot and not is_mentioned and not starts_prefix:
+        # اگر پیام ریپلای به ربات نبود و با کلمه "ربات" هم شروع نشده بود، کاملاً نادیده گرفته شود
+        if not is_reply_to_bot and not robot_match and not is_exact_robot_call:
             return
 
-        text = text.replace(bot_username, "").replace(f"@{bot_info.username}", "").strip()
-        for p in call_prefixes:
-            if lower_text == p or lower_text.startswith(p + " ") or lower_text.startswith(p + "\n"):
-                text = text[len(p):].strip()
-                break
+        if robot_match:
+            text = robot_match.group(2).strip()
+        elif is_exact_robot_call:
+            text = "سلام! در خدمتم، چطور می‌تونم کمکت کنم؟"
 
+        # پاسخ به پیام ریپلای‌شده کاربر دیگر در صورت صدا زدن ربات
         if msg.reply_to_message and str(msg.reply_to_message.from_user.id) != bot_id:
             target_user = msg.reply_to_message.from_user
             target_name = target_user.first_name or "کاربر"
@@ -1238,7 +1227,7 @@ def handle_callbacks(query):
         idx = data.replace("edit_img_model_", "")
         safe_kv_put(f"ADMIN_EDIT_IMG_IDX_{user_id}", idx)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_IMG_NAME")
-        bot.send_message(chat_id, "✏️ نام جدید مدل تصویر را وارد کنید (یا .):")
+        bot.send_message(chat_id, "✏️ نام جدید مدل تصویر را وارد کنید (یا . برای عدم تغییر):")
 
     elif data.startswith("del_model_") and user_id == ADMIN_ID:
         idx = int(data.replace("del_model_", ""))
@@ -1355,7 +1344,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
             models[idx]["name"] = text
             safe_kv_put("AI_MODELS", models)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_MODEL_URL")
-        bot.send_message(chat_id, "🌐 URL Base جدید (یا .):")
+        bot.send_message(chat_id, "🌐 URL Base جدید (یا . برای عدم تغییر):")
 
     elif step == "EDIT_MODEL_URL":
         idx = int(safe_kv_get(f"ADMIN_EDIT_IDX_{user_id}") or "0")
@@ -1364,7 +1353,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
             models[idx]["baseUrl"] = text
             safe_kv_put("AI_MODELS", models)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_MODEL_KEY")
-        bot.send_message(chat_id, "🔑 API Key جدید (یا .):")
+        bot.send_message(chat_id, "🔑 API Key جدید (یا . برای عدم تغییر):")
 
     elif step == "EDIT_MODEL_KEY":
         idx = int(safe_kv_get(f"ADMIN_EDIT_IDX_{user_id}") or "0")
@@ -1373,7 +1362,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
             models[idx]["apiKey"] = text
             safe_kv_put("AI_MODELS", models)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_MODEL_ID")
-        bot.send_message(chat_id, "📌 Model Name جدید (یا .):")
+        bot.send_message(chat_id, "📌 Model Name جدید (یا . برای عدم تغییر):")
 
     elif step == "EDIT_MODEL_ID":
         idx = int(safe_kv_get(f"ADMIN_EDIT_IDX_{user_id}") or "0")
@@ -1382,7 +1371,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
             models[idx]["modelName"] = text
             safe_kv_put("AI_MODELS", models)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_MODEL_VISION")
-        bot.send_message(chat_id, "👁 قابلیت Vision؟ (`yes` یا `no` یا .)", parse_mode="Markdown")
+        bot.send_message(chat_id, "👁 قابلیت Vision؟ (`yes` یا `no` یا . برای عدم تغییر)", parse_mode="Markdown")
 
     elif step == "EDIT_MODEL_VISION":
         idx = int(safe_kv_get(f"ADMIN_EDIT_IDX_{user_id}") or "0")
@@ -1392,6 +1381,43 @@ def handle_admin_steps(chat_id, user_id, text, step):
             safe_kv_put("AI_MODELS", models)
         clear_user_state(user_id)
         bot.send_message(chat_id, "✅ مدل چت ویرایش شد!")
+        bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", reply_markup=get_admin_panel_markup())
+
+    elif step == "EDIT_IMG_NAME":
+        idx = int(safe_kv_get(f"ADMIN_EDIT_IMG_IDX_{user_id}") or "0")
+        img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
+        if text != "." and idx < len(img_models):
+            img_models[idx]["name"] = text.strip()
+            safe_kv_put("IMAGE_MODELS", img_models)
+        safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_IMG_URL")
+        bot.send_message(chat_id, "🌐 URL Base جدید تصویرساز (یا . برای عدم تغییر):")
+
+    elif step == "EDIT_IMG_URL":
+        idx = int(safe_kv_get(f"ADMIN_EDIT_IMG_IDX_{user_id}") or "0")
+        img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
+        if text != "." and idx < len(img_models):
+            img_models[idx]["baseUrl"] = text.strip()
+            safe_kv_put("IMAGE_MODELS", img_models)
+        safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_IMG_KEY")
+        bot.send_message(chat_id, "🔑 API Key جدید تصویرساز (یا . برای عدم تغییر):")
+
+    elif step == "EDIT_IMG_KEY":
+        idx = int(safe_kv_get(f"ADMIN_EDIT_IMG_IDX_{user_id}") or "0")
+        img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
+        if text != "." and idx < len(img_models):
+            img_models[idx]["apiKey"] = "" if text.strip() == "." else text.strip()
+            safe_kv_put("IMAGE_MODELS", img_models)
+        safe_kv_put(f"ADMIN_STEP_{user_id}", "EDIT_IMG_ID")
+        bot.send_message(chat_id, "📌 Model Name جدید تصویرساز (یا . برای عدم تغییر):")
+
+    elif step == "EDIT_IMG_ID":
+        idx = int(safe_kv_get(f"ADMIN_EDIT_IMG_IDX_{user_id}") or "0")
+        img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
+        if text != "." and idx < len(img_models):
+            img_models[idx]["modelName"] = text.strip()
+            safe_kv_put("IMAGE_MODELS", img_models)
+        clear_user_state(user_id)
+        bot.send_message(chat_id, "✅ مدل ساخت عکس با موفقیت ویرایش شد!")
         bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", reply_markup=get_admin_panel_markup())
 
     elif step == "ADD_SPONSOR":
@@ -1421,7 +1447,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
 # ==========================================
 if __name__ == "__main__":
     print("=" * 45)
-    print("🤖 Neo-AI-Bot with Group & Private Code-to-File Started")
+    print("🤖 Neo-AI-Bot with Smart Persian Trigger Started")
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | SSE Streaming Active")
     print("=" * 45)
