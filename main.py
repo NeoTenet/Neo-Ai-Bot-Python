@@ -18,10 +18,9 @@ Features:
 - Group Moderation Suite (Mute, Timed-Mute, Unmute, Ban, Delete) for Admins
 - Anti-Clutter: No long code dumps in group or private chats
 - Strict UTF-8 Streaming Engine (No Mojibake)
-- [جدید] حذف تکی و انتخابی چت‌ها از حافظه
-- [جدید] تفکیک هوشمند و صددرصدی مدل چت و عکس در گروه‌ها (جلوگیری از تداخل)
-- سیستم دوطرفه ارتباط مستقیم کاربر با ادمین و پاسخگویی ادمین
-- کلید روشن/خاموش سراسری ربات از پنل ادمین
+- [جدید] دکمه لغو زنده ساخت تصویر هوش مصنوعی
+- [جدید] حل باگ تداخل مدل متن و عکس و ریست خودکار وضعیت
+- [جدید] آمارگیری اتمیک بدون خطا با Redis Sets (جلوگیری قطعی از پریدن آمار کاربران)
 Timeout: 35 Minutes (2100s)
 Developer Channel: T.me/Neotenet
 """
@@ -207,13 +206,18 @@ def detect_image_intent(text):
     clean = text.strip()
     lower = clean.lower()
 
-    # کلماتی که اگر در متن باشند نشان‌دهنده سوال متنی یا کدنویسی هستند نه عکس!
+    # کلماتی که نشان‌دهنده سوال متنی، گفتگو یا درباره مدل‌ها هستند نه ساخت عکس
     text_code_guards = [
         'کد', 'برنامه', 'اسکریپت', 'تابع', 'متغیر', 'پایتون', 'جاوا', 'html', 'css', 'sql',
         'دیباگ', 'ارور', 'خطا', 'حل کن', 'توضیح بده', 'توضیح بدید', 'توضیح دهید',
-        'چیست', 'کیست', 'چرا', 'چطور', 'چگونه', 'راهنمایی', 'بنویس', 'ترجمه', 'متن', 'مقاله'
+        'چیست', 'کیست', 'چرا', 'چطور', 'چگونه', 'راهنمایی', 'بنویس', 'ترجمه', 'متن', 'مقاله',
+        'مدل', 'هوش مصنوعی', 'ربات', 'بات', 'تنظیمات', 'قابلیت', 'سوال', 'سلام', 'درود'
     ]
     has_text_guard = any(guard in lower for guard in text_code_guards)
+
+    # اگر کاربر کلماتی مانند کد یا سوال یا صحبت درباره مدل پرسیده، به هیچ وجه به عنوان عکس پردازش نشود
+    if has_text_guard:
+        return False, clean
 
     # تشخیص انگلیسی
     en_triggers = ["draw ", "paint ", "generate image", "create image", "create photo", "create picture", "image of ", "photo of ", "picture of "]
@@ -222,37 +226,53 @@ def detect_image_intent(text):
             prompt = re.sub(r'^(?:please\s+)?(?:make|draw|paint|generate|create|imagine)\s+(?:a|an|the)?\s*(?:image|photo|picture)?\s*(?:of)?\s*', '', clean, flags=re.IGNORECASE)
             return True, prompt.strip() or clean
 
-    # تشخیص فارسی دقیق: باید حتماً کلمه تصویری وجود داشته باشد
+    # افعال و کلمات صریح ساخت عکس در زبان فارسی
+    fa_visual_verbs = ["بکش", "نقاشی کن", "تولید کن", "طراحی کن", "بساز", "خلق کن", "ایجاد کن", "درست کن", "تصویرسازی کن"]
+    has_visual_verb = any(v in clean for v in fa_visual_verbs)
+
     fa_visual_nouns = ["عکس", "تصویر", "نقاشی", "پوستر", "والپیپر"]
     has_visual_noun = any(n in clean for n in fa_visual_nouns)
 
-    fa_visual_verbs = ["بکش", "نقاشی کن", "تولید کن", "طراحی کن", "بساز", "خلق کن"]
-    has_visual_verb = any(v in clean for v in fa_visual_verbs)
-
-    # اگر کاربر کلماتی مانند کد یا سوال مطرح کرده و صراحتاً ننوشته «عکس فلان چیز»، به هیچ وجه به عنوان عکس پردازش نشود
-    if has_text_guard:
-        return False, clean
-
-    # فقط اگر نام تصویری به همراه فعل تصویری یا پیشوندهای مشخص آمده باشد عکس است
-    if has_visual_noun and (has_visual_verb or any(clean.startswith(f"{n} ") or clean.startswith(f"یک {n}") or clean.startswith(f"یه {n}") for n in fa_visual_nouns)):
+    if has_visual_noun and has_visual_verb:
         prompt = clean
         prompt = re.sub(r'(?:لطفاً|لطفا|بی زحمت|برام|برای من|یه|یک)\s+', '', prompt)
         prompt = re.sub(r'(?:عکس|تصویر|نقاشی|پوستر|والپیپر)\s+(?:از|بکش\s+از|بساز\s+از|تولید\s+کن\s+از)?\s*', '', prompt)
-        prompt = re.sub(r'\s+(?:عکس|تصویر|نقاشی)?\s*(?:بساز|بکش|تولید کن|طراحی کن|بده|درست کن|خلق کن)$', '', prompt)
+        prompt = re.sub(r'\s+(?:عکس|تصویر|نقاشی)?\s*(?:بساز|بکش|تولید کن|طراحی کن|بده|درست کن|خلق کن|ایجاد کن|تصویرسازی کن)$', '', prompt)
         prompt = re.sub(r'^(?:از)\s+', '', prompt)
         return True, prompt.strip() or clean
+
+    # الگوهای ساختاریافته مانند "عکس از ..." یا "یک عکس از ..."
+    prefix_pattern = r'^(?:یک\s+|یه\s+)?(?:عکس|تصویر|نقاشی|پوستر|والپیپر)\s+از\s+(.+)$'
+    m = re.match(prefix_pattern, clean, flags=re.IGNORECASE)
+    if m:
+        return True, m.group(1).strip()
 
     return False, clean
 
 # ==========================================
-# توابع بررسی دسترسی و مدیریت کاربر
+# توابع بررسی دسترسی و مدیریت کاربر (اتمیک و ضد افت آمار)
 # ==========================================
+def get_all_bot_users():
+    """دریافت لیست تمام کاربران بدون خطر پریدن یا بازنویسی دیتابیس"""
+    set_users = upstash_command(["SMEMBERS", "BOT_USERS_SET"]) or []
+    old_users = []
+    old_raw = safe_kv_get("BOT_USERS")
+    if old_raw:
+        try:
+            old_users = json.loads(old_raw)
+        except Exception:
+            pass
+    # ترکیب ایمن دو منبع برای حفظ تمامی کاربران قبلی و جدید
+    all_users = list(set([str(u) for u in (set_users + old_users) if str(u).strip()]))
+    return all_users
+
 def track_user_activity(user_id):
-    users = json.loads(safe_kv_get("BOT_USERS") or "[]")
-    if user_id not in users:
-        users.append(user_id)
-        safe_kv_put("BOT_USERS", users)
-    safe_kv_put(f"LAST_ACTIVE_{user_id}", str(int(time.time() * 1000)))
+    """ثبت اتمیک کاربر با SADD برای جلوگیری کامل از حذف شدن تصادفی کاربران"""
+    try:
+        upstash_command(["SADD", "BOT_USERS_SET", str(user_id)])
+        safe_kv_put(f"LAST_ACTIVE_{user_id}", str(int(time.time() * 1000)))
+    except Exception as e:
+        print(f"[Track User Error]: {e}")
 
 def clear_user_state(user_id):
     for key in [
@@ -446,7 +466,7 @@ def process_code_and_text(raw_text, is_code_prompt):
     return raw_text, []
 
 # ==========================================
-# 📤 تابع تضمینی ارسال فایل در گروه و پیوی
+# 📤 تابع ارسال فایل سورس کد
 # ==========================================
 def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None, thread_id=None):
     caption = f"📁 فایل سورس کد ({ext.upper()}): {filename}"
@@ -511,7 +531,7 @@ def get_main_menu_markup(user_id):
 def send_main_menu(chat_id, user_id):
     bot.send_message(
         chat_id,
-        "🚀سلام دوست خوبم به ربات هوش مصنوعی خودت خوش امدی از منو پایین گزینه مورد نظرت رو انتخاب کن 🫡!",
+        "🚀 سلام دوست خوبم به ربات هوش مصنوعی خودت خوش امدی از منو پایین گزینه مورد نظرت رو انتخاب کن 🫡!",
         reply_markup=get_main_menu_markup(user_id)
     )
 
@@ -537,7 +557,6 @@ def send_history_menu(chat_id, user_id, message_id=None):
         date_str = format_session_date(s.get("date"))
         title = f"{is_cur}{s.get('title')} [{date_str}]"
         
-        # ردیف حاوی نام چت + دکمه قرمز اختصاصی حذف تکی
         markup.row(
             types.InlineKeyboardButton(title, callback_data=f"switch_sess_{sid}"),
             types.InlineKeyboardButton("🗑", callback_data=f"del_single_sess_{sid}", style="danger")
@@ -652,7 +671,7 @@ def send_image_model_selection_menu(chat_id, user_id, is_group=False):
     bot.send_message(chat_id, "🎨 **مدل ساخت عکس را انتخاب کنید:**", parse_mode="Markdown", reply_markup=markup)
 
 # ==========================================
-# ۲. پنل مدیریت ادمین (سوئیچ روشن/خاموش + حذف کل دیتابیس)
+# ۲. پنل مدیریت ادمین
 # ==========================================
 def get_admin_panel_markup():
     is_active = safe_kv_get("BOT_GLOBAL_STATUS") != "off"
@@ -691,7 +710,7 @@ def get_admin_panel_markup():
     return markup
 
 def send_bot_stats(chat_id):
-    users = json.loads(safe_kv_get("BOT_USERS") or "[]")
+    users = get_all_bot_users()
     total_users = len(users)
 
     now_ms = int(time.time() * 1000)
@@ -712,15 +731,15 @@ def send_bot_stats(chat_id):
     text = (
         f"📊 **آمار جامع کاربران و وضعیت ربات:**\n\n"
         f"⚡ وضعیت ربات: **{status_str}**\n"
-        f"👥 کل کاربران ثبت‌نامی: **{total_users}**\n"
-        f"🟢 کاربران آنلاین / فعال (۲۴ ساعت گذشته): **{active_count}**"
+        f"👥 کل کاربران ثبت‌نامی در حافظه: **{total_users}**\n"
+        f"🟢 کاربران فعال در ۲۴ ساعت اخیر: **{active_count}**"
     )
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel", style="primary"))
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
 def broadcast_worker(admin_chat_id, message_id):
-    users = json.loads(safe_kv_get("BOT_USERS") or "[]")
+    users = get_all_bot_users()
     if not users:
         bot.send_message(admin_chat_id, "⚠️ هیچ کاربری در دیتابیس ربات ثبت نشده است.")
         return
@@ -815,7 +834,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     bot.send_message(chat_id, list_text, reply_markup=markup)
 
 # ==========================================
-# ۳. پردازش چت هوش مصنوعی (بدون نشت افکار + پاسخ آنی احوالپرسی)
+# ۳. پردازش چت هوش مصنوعی
 # ==========================================
 def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id, thread_id=None):
     models = json.loads(safe_kv_get("AI_MODELS") or "[]")
@@ -1073,7 +1092,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 pass
 
 # ==========================================
-# ۴. پردازش ساخت عکس (کرنومتر زنده)
+# ۴. پردازش ساخت عکس (کرنومتر زنده + دکمه لغو فعال)
 # ==========================================
 def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None):
     img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
@@ -1088,7 +1107,18 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         return
 
     active_img_model = img_models[img_idx]
-    status_msg = bot.send_message(chat_id, f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00", message_thread_id=thread_id)
+
+    # تنظیم دکمه لغو ساخت تصویر
+    req_id = f"{user_id}_img_{int(time.time()*1000)}"
+    cancel_markup = types.InlineKeyboardMarkup()
+    cancel_markup.add(types.InlineKeyboardButton("❌ لغو ساخت تصویر", callback_data=f"cancel_req_{req_id}", style="danger"))
+
+    status_msg = bot.send_message(
+        chat_id,
+        f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00",
+        reply_markup=cancel_markup,
+        message_thread_id=thread_id
+    )
     status_msg_id = status_msg.message_id
     is_done = False
     image_data = None
@@ -1099,7 +1129,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         last_edit_time = 0
         while not is_done:
             time.sleep(0.5)
-            if is_done:
+            if is_done or safe_kv_get(f"CANCEL_{req_id}") == "true":
                 break
 
             now = time.time()
@@ -1112,7 +1142,12 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 secs = elapsed % 60
                 time_display = f"{mins:02d}:{secs:02d}"
                 try:
-                    bot.edit_message_text(f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}", chat_id=chat_id, message_id=status_msg_id)
+                    bot.edit_message_text(
+                        f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}",
+                        chat_id=chat_id,
+                        message_id=status_msg_id,
+                        reply_markup=cancel_markup
+                    )
                     last_edit_time = now
                 except ApiTelegramException as te:
                     if te.error_code == 429:
@@ -1140,6 +1175,8 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 data={"prompt": prompt_text, "output_format": "webp"},
                 timeout=(60, 2100)
             )
+            if safe_kv_get(f"CANCEL_{req_id}") == "true":
+                return
             if res.status_code == 200:
                 image_data = res.content
             else:
@@ -1165,6 +1202,8 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 "size": "1024x1024"
             }
             res = http_session.post(endpoint, headers=headers, json=payload, timeout=(60, 2100))
+            if safe_kv_get(f"CANCEL_{req_id}") == "true":
+                return
             if res.status_code == 200:
                 data = res.json()
                 if "data" in data and len(data["data"]) > 0:
@@ -1176,6 +1215,17 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         error_msg = str(e)
     finally:
         is_done = True
+
+    # بررسی لغو شدن توسط کاربر
+    if safe_kv_get(f"CANCEL_{req_id}") == "true":
+        safe_kv_delete(f"CANCEL_{req_id}")
+        try:
+            bot.edit_message_text("❌ عملیات ساخت تصویر توسط کاربر لغو گردید.", chat_id=chat_id, message_id=status_msg_id)
+        except Exception:
+            pass
+        return
+
+    safe_kv_delete(f"CANCEL_{req_id}")
 
     if image_data:
         try:
@@ -1218,6 +1268,7 @@ def handle_all_messages(msg):
         )
         return
 
+    # ثبت امن کاربر در دیتابیس (بدون ریسک حذف دیتابیس)
     threading.Thread(target=track_user_activity, args=(user_id,), daemon=True).start()
 
     # محتوای فایل‌های متنی/کد
@@ -1311,6 +1362,7 @@ def handle_all_messages(msg):
             )
             return
         clear_user_state(user_id)
+        safe_kv_delete(f"USER_MODE_{user_id}")
         send_main_menu(chat_id, user_id)
         return
 
@@ -1462,7 +1514,6 @@ def handle_all_messages(msg):
     target_key_id = f"group_{chat_id}" if is_group else user_id
     has_photo_attached = bool(msg.photo or (msg.reply_to_message and msg.reply_to_message.photo))
     
-    # تفکیک دقیق: در گروه هرگز حالت اجباری عکس (Force Mode) اعمال نمی‌شود تا تداخل رخ ندهد
     user_forced_mode = None if is_group else safe_kv_get(f"USER_MODE_{target_key_id}")
     
     is_img_prompt = False
@@ -1470,6 +1521,13 @@ def handle_all_messages(msg):
 
     if not has_photo_attached:
         is_img_prompt, clean_img_prompt = detect_image_intent(text)
+
+    # اگر کاربر در حالت عکس بود اما سوال متنی پرسید یا احوالپرسی کرد، اولویت با چت باشد
+    if user_forced_mode == "IMAGE_GEN":
+        if is_casual_greeting(text) or any(g in text.lower() for g in ['کد', 'برنامه', 'مدل', 'توضیح', 'چرا', 'چطور', 'چیست', 'سلام']):
+            is_img_prompt = False
+            user_forced_mode = None
+            safe_kv_delete(f"USER_MODE_{target_key_id}")
 
     # فقط در صورت تشخیص قطعی عکس، به مدل عکس ارسال شود
     if is_img_prompt or (user_forced_mode == "IMAGE_GEN" and not has_photo_attached):
@@ -1494,6 +1552,7 @@ def handle_callbacks(query):
         bot.answer_callback_query(query.id, "⚠️ ربات هم‌اکنون توسط ادمین موقتاً خاموش شده است.", show_alert=True)
         return
 
+    # هندلر مشترک لغو (هم برای چت و هم برای ساخت تصویر)
     if data.startswith("cancel_req_"):
         req_id = data.replace("cancel_req_", "")
         owner_id = req_id.split("_")[0]
@@ -1504,7 +1563,7 @@ def handle_callbacks(query):
         bot.answer_callback_query(query.id, "✅ درخواست لغو شد.")
         safe_kv_put(f"CANCEL_{req_id}", "true", 2100)
         try:
-            bot.edit_message_text("❌ درخواست توسط کاربر لغو شد.", chat_id=chat_id, message_id=query.message.message_id)
+            bot.edit_message_text("❌ عملیات با موفقیت لغو شد.", chat_id=chat_id, message_id=query.message.message_id)
         except Exception:
             pass
         return
@@ -1575,7 +1634,7 @@ def handle_callbacks(query):
 
     # پاکسازی تمام سوابق و تاریخچه‌ها توسط ادمین
     elif data == "admin_purge_all_hist" and user_id == ADMIN_ID:
-        users = json.loads(safe_kv_get("BOT_USERS") or "[]")
+        users = get_all_bot_users()
         count_purged = 0
         for u in users:
             sessions = json.loads(safe_kv_get(f"SESSIONS_{u}") or "[]")
@@ -1633,6 +1692,9 @@ def handle_callbacks(query):
         idx = data.replace("set_model_", "")
         safe_kv_put(f"USER_MODEL_{target_key_id}", idx)
         
+        # نکته کلیدی: با انتخاب مدل چت، وضعیت ساخت عکس فورس شده پاک می‌شود تا تداخلی رخ ندهد
+        safe_kv_delete(f"USER_MODE_{target_key_id}")
+        
         active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
         if active_sess:
             safe_kv_delete(f"HISTORY_{user_id}_{active_sess}")
@@ -1666,22 +1728,16 @@ def handle_callbacks(query):
     elif data == "history_menu" and not is_group:
         send_history_menu(chat_id, user_id)
 
-    # ==========================================
-    # 🗑 حذف تکی و انتخابی چت از حافظه
-    # ==========================================
     elif data.startswith("del_single_sess_") and not is_group:
         del_id = data.replace("del_single_sess_", "")
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
         active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
 
-        # حذف تاریخچه پیام‌های این چت خاص از دیتابیس
         safe_kv_delete(f"HISTORY_{user_id}_{del_id}")
 
-        # حذف این جلسه از لیست جلسات
         new_sessions = [s for s in sessions if s.get("id") != del_id]
         safe_kv_put(f"SESSIONS_{user_id}", new_sessions)
 
-        # اگر چتی که حذف شد چت فعال فعلی بود، چت دیگری را فعال کن
         if active_sess == del_id:
             if new_sessions:
                 safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_sessions[0]["id"])
@@ -1696,7 +1752,6 @@ def handle_callbacks(query):
         except Exception:
             pass
 
-        # به‌روزرسانی منوی تاریخچه در همان پیام
         send_history_menu(chat_id, user_id, message_id=query.message.message_id)
 
     elif data == "clear_all_history" and not is_group:
@@ -1735,6 +1790,7 @@ def handle_callbacks(query):
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
         sessions.insert(0, {"id": new_sess, "title": "گفتگوی جدید 💬", "date": get_jalali_date()})
         safe_kv_put(f"SESSIONS_{user_id}", sessions)
+        safe_kv_delete(f"USER_MODE_{user_id}")
         bot.send_message(chat_id, "✨ چت جدید ایجاد شد! پیام خود را بفرستید.")
 
     elif data.startswith("switch_sess_") and not is_group:
