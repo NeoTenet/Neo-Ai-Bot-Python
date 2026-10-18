@@ -57,11 +57,11 @@ types.InlineKeyboardButton.to_dict = _custom_btn_to_dict
 # ==========================================
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "Toekn Bot")
-ADMIN_ID = str(os.getenv("ADMIN_ID", "ID PASTE HERE"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT TOKEN")
+ADMIN_ID = str(os.getenv("ADMIN_ID", "ID ADMIN"))
 
-UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious-upstash.io")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "Site Token")
+UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious.upstash.io")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "DATE BASE TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ==========================================
