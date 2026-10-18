@@ -3,13 +3,15 @@
 Telegram AI Bot - Python + Upstash Redis (100% Safe & Stable)
 Configured for: bot-hosting.net (Docker / NAT Environment)
 Features:
+- Native Stability AI v2beta Support (Ultra, Core, SD3 - No 404 Error)
+- Modern Colored Buttons Injection (Primary Blue, Success Green, Danger Red)
 - Group Moderation Suite (Mute, Timed-Mute, Unmute, Ban, Delete) for Admins
 - Flexible Group AI Trigger ('ربات <پیام>' or direct reply)
 - Complete Image Model Editor (Full Wizard Flow)
 - Guaranteed Group & Private File-Only Code Delivery (.py, .js, .html, .cpp, .txt)
 - Anti-Clutter: No long code dumps in group or private chats
 - Strict UTF-8 Streaming Engine (No Mojibake)
-- Full Image Generation Support (SiliconFlow, Together, Flux)
+- Full Image Generation Support (Stability AI, SiliconFlow, Together, Flux)
 - TCP Keep-Alive Connection Resilience
 - Admin Broadcast Engine
 Timeout: 35 Minutes (2100s) | Updates Every 5 Seconds
@@ -33,14 +35,33 @@ from telebot.types import ChatPermissions
 from telebot.apihelper import ApiTelegramException
 
 # ==========================================
+# 🎨 تزریق مستقیم دکمه‌های رنگی به تل‌بات (Monkey-Patch)
+# ==========================================
+_orig_btn_init = types.InlineKeyboardButton.__init__
+def _custom_btn_init(self, *args, **kwargs):
+    self.style = kwargs.pop('style', None)
+    self.icon_custom_emoji_id = kwargs.pop('icon_custom_emoji_id', None)
+    _orig_btn_init(self, *args, **kwargs)
+types.InlineKeyboardButton.__init__ = _custom_btn_init
+
+_orig_btn_to_dict = types.InlineKeyboardButton.to_dict
+def _custom_btn_to_dict(self):
+    d = _orig_btn_to_dict(self)
+    if hasattr(self, 'style') and self.style:
+        d['style'] = self.style
+    if hasattr(self, 'icon_custom_emoji_id') and self.icon_custom_emoji_id:
+        d['icon_custom_emoji_id'] = self.icon_custom_emoji_id
+    return d
+types.InlineKeyboardButton.to_dict = _custom_btn_to_dict
+
+# ==========================================
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7123456789:AAFlm4bXYZ_YOUR_REAL_TOKEN_HERE")
-ADMIN_ID = str(os.getenv("ADMIN_ID", "123456789"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8970181549:AAF4YvZYx6n63b9Rsyi92IH-80OuyfLhhBs")
+ADMIN_ID = str(os.getenv("ADMIN_ID", "1033630752"))
 
-UPSTASH_URL = os.getenv("UPSTASH_URL", "https://your-upstash-url.upstash.io")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "YOUR_UPSTASH_REST_TOKEN")
-
+UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious-chimp-214916.upstash.io")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "gQAAAAAAA0eEAAIgcDFhODllMjRiMTVkZDQ0OGU0ODgxMzY5ZTg1M2NlOTliMQ")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ==========================================
@@ -366,21 +387,21 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         return False
 
 # ==========================================
-# ۱. رابط کاربری و منوها (چینش ۲ تایی دکمه‌ها)
+# ۱. رابط کاربری منوی اصلی (با استایل رنگی تزریق‌شده)
 # ==========================================
 def get_main_menu_markup(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("💬 گفتگو و کدنویسی", callback_data="mode_chat"),
-        types.InlineKeyboardButton("🎨 تصویرسازی هوش مصنوعی", callback_data="mode_image")
+        types.InlineKeyboardButton("💬 گفتگو و کدنویسی", callback_data="mode_chat", style="primary"),
+        types.InlineKeyboardButton("🎨 تصویرسازی هوش مصنوعی", callback_data="mode_image", style="success")
     )
     markup.add(
         types.InlineKeyboardButton("🤖 انتخاب مدل هوش مصنوعی", callback_data="select_model_menu"),
         types.InlineKeyboardButton("📜 تاریخچه گفتگوها", callback_data="history_menu")
     )
-    row3 = [types.InlineKeyboardButton("➕ شروع گفتگوی جدید", callback_data="new_chat")]
+    row3 = [types.InlineKeyboardButton("➕ شروع گفتگوی جدید", callback_data="new_chat", style="success")]
     if str(user_id) == str(ADMIN_ID):
-        row3.append(types.InlineKeyboardButton("⚙️ پنل مدیریت ادمین", callback_data="admin_panel"))
+        row3.append(types.InlineKeyboardButton("⚙️ پنل مدیریت ادمین", callback_data="admin_panel", style="primary"))
     markup.add(*row3)
     return markup
 
@@ -411,7 +432,7 @@ def send_history_menu(chat_id, user_id):
         markup.row(*buttons[i:i+2])
 
     markup.add(
-        types.InlineKeyboardButton("➕ ایجاد چت جدید", callback_data="new_chat"),
+        types.InlineKeyboardButton("➕ ایجاد چت جدید", callback_data="new_chat", style="success"),
         types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")
     )
     bot.send_message(chat_id, "📜 **لیست گفتگوهای قبلی شما:**", parse_mode="Markdown", reply_markup=markup)
@@ -459,29 +480,29 @@ def send_image_model_selection_menu(chat_id, user_id):
     bot.send_message(chat_id, "🎨 **مدل ساخت عکس را انتخاب کنید:**", parse_mode="Markdown", reply_markup=markup)
 
 # ==========================================
-# ۲. پنل مدیریت ادمین (ارسال پیام همگانی)
+# ۲. پنل مدیریت ادمین (دکمه‌های رنگی)
 # ==========================================
 def get_admin_panel_markup():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats"),
-        types.InlineKeyboardButton("📢 پیام همگانی", callback_data="admin_broadcast")
+        types.InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats", style="primary"),
+        types.InlineKeyboardButton("📢 پیام همگانی", callback_data="admin_broadcast", style="primary")
     )
     markup.add(
-        types.InlineKeyboardButton("➕ افزودن مدل چت", callback_data="admin_add_model"),
-        types.InlineKeyboardButton("🎨 افزودن مدل عکس", callback_data="admin_add_img_model")
+        types.InlineKeyboardButton("➕ افزودن مدل چت", callback_data="admin_add_model", style="success"),
+        types.InlineKeyboardButton("🎨 افزودن مدل عکس", callback_data="admin_add_img_model", style="success")
     )
     markup.add(
         types.InlineKeyboardButton("📋 لیست مدل‌ها", callback_data="admin_list_models"),
-        types.InlineKeyboardButton("✏️ ویرایش مدل‌ها", callback_data="admin_edit_models_menu")
+        types.InlineKeyboardButton("✏️ ویرایش مدل‌ها", callback_data="admin_edit_models_menu", style="primary")
     )
     markup.add(
-        types.InlineKeyboardButton("📢 افزودن اسپانسر", callback_data="admin_add_sponsor"),
-        types.InlineKeyboardButton("🗑 حذف اسپانسر", callback_data="admin_del_sponsor_menu")
+        types.InlineKeyboardButton("📢 افزودن اسپانسر", callback_data="admin_add_sponsor", style="primary"),
+        types.InlineKeyboardButton("🗑 حذف اسپانسر", callback_data="admin_del_sponsor_menu", style="danger")
     )
     markup.add(
-        types.InlineKeyboardButton("🚫 مسدودسازی کاربر", callback_data="admin_ban_user"),
-        types.InlineKeyboardButton("✅ رفع مسدودی", callback_data="admin_unban_user")
+        types.InlineKeyboardButton("🚫 مسدودسازی کاربر", callback_data="admin_ban_user", style="danger"),
+        types.InlineKeyboardButton("✅ رفع مسدودی", callback_data="admin_unban_user", style="success")
     )
     markup.add(
         types.InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")
@@ -501,7 +522,7 @@ def send_bot_stats(chat_id):
 
     text = f"📊 **آمار جامع کاربران ربات:**\n\n👥 کل کاربران ثبت‌نامی: **{len(users)}**\n🟢 کاربران آنلاین / فعال (۲۴ ساعت گذشته): **{active_count}**"
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel"))
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel", style="primary"))
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
 def broadcast_worker(admin_chat_id, message_id):
@@ -544,9 +565,9 @@ def send_admin_models_list(chat_id, message_id=None):
     buttons = []
 
     for idx, m in enumerate(chat_models):
-        buttons.append(types.InlineKeyboardButton(f"🗑 چت: {m.get('name')}", callback_data=f"del_model_{idx}"))
+        buttons.append(types.InlineKeyboardButton(f"🗑 چت: {m.get('name')}", callback_data=f"del_model_{idx}", style="danger"))
     for idx, m in enumerate(img_models):
-        buttons.append(types.InlineKeyboardButton(f"🗑 عکس: {m.get('name')}", callback_data=f"del_img_model_{idx}"))
+        buttons.append(types.InlineKeyboardButton(f"🗑 عکس: {m.get('name')}", callback_data=f"del_img_model_{idx}", style="danger"))
 
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i+2])
@@ -568,9 +589,9 @@ def send_admin_edit_models_list(chat_id):
     buttons = []
 
     for idx, m in enumerate(chat_models):
-        buttons.append(types.InlineKeyboardButton(f"✏️ چت: {m.get('name')}", callback_data=f"edit_model_{idx}"))
+        buttons.append(types.InlineKeyboardButton(f"✏️ چت: {m.get('name')}", callback_data=f"edit_model_{idx}", style="primary"))
     for idx, m in enumerate(img_models):
-        buttons.append(types.InlineKeyboardButton(f"✏️ عکس: {m.get('name')}", callback_data=f"edit_img_model_{idx}"))
+        buttons.append(types.InlineKeyboardButton(f"✏️ عکس: {m.get('name')}", callback_data=f"edit_img_model_{idx}", style="primary"))
 
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i+2])
@@ -585,7 +606,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     buttons = []
 
     for idx, ch in enumerate(channels):
-        buttons.append(types.InlineKeyboardButton(f"🗑 {ch}", callback_data=f"del_sponsor_{idx}"))
+        buttons.append(types.InlineKeyboardButton(f"🗑 {ch}", callback_data=f"del_sponsor_{idx}", style="danger"))
 
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i+2])
@@ -623,7 +644,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
     req_id = f"{user_id}_{int(time.time()*1000)}"
     cancel_markup = types.InlineKeyboardMarkup()
-    cancel_markup.add(types.InlineKeyboardButton("❌ لغو و توقف فکر کردن", callback_data=f"cancel_req_{req_id}"))
+    cancel_markup.add(types.InlineKeyboardButton("❌ لغو و توقف فکر کردن", callback_data=f"cancel_req_{req_id}", style="danger"))
 
     reply_to = target_reply_id if target_reply_id else (message.message_id if is_group else None)
     initial_text = "💻 در حال نوشتن و آماده‌سازی فایل کد... (۵ ثانیه)" if is_code else "🧠 در حال فکر کردن و ارتباط با API... (۵ ثانیه)"
@@ -838,7 +859,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 pass
 
 # ==========================================
-# ۴. پردازش ساخت عکس (سازگار با SiliconFlow, Together و Pollinations)
+# ۴. پردازش ساخت عکس (پشتیبانی اختصاصی از Stability AI و سایر سرویس‌ها)
 # ==========================================
 def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None):
     img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
@@ -856,7 +877,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
     status_msg = bot.send_message(chat_id, "🎨 در حال ساخت تصویر... (۵ ثانیه)", message_thread_id=thread_id)
     status_msg_id = status_msg.message_id
     is_done = False
-    image_url = None
+    image_data = None
     error_msg = None
 
     def timer_loop():
@@ -868,10 +889,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             sec += 5
             mins = sec // 60
             secs = sec % 60
-            if mins > 0:
-                time_display = f"{mins} دقیقه و {secs} ثانیه" if secs > 0 else f"{mins} دقیقه"
-            else:
-                time_display = f"{secs} ثانیه"
+            time_display = f"{mins} دقیقه و {secs} ثانیه" if secs > 0 else f"{secs} ثانیه"
             try:
                 bot.edit_message_text(f"🎨 در حال ساخت تصویر و رندر... ({time_display})", chat_id=chat_id, message_id=status_msg_id)
             except ApiTelegramException as te:
@@ -887,11 +905,32 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         api_key = active_img_model.get("apiKey", "").strip()
         model_name = active_img_model.get("modelName", "").strip()
 
-        if "pollinations.ai" in base_url:
+        # ۱. اگر سرور Stability AI بود (جلوگیری از ارور ۴۰۴ با ارسال Multipart Form-data)
+        if "stability.ai" in base_url:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "image/*"
+            }
+            res = http_session.post(
+                base_url,
+                headers=headers,
+                files={"none": ''},
+                data={"prompt": prompt_text, "output_format": "webp"},
+                timeout=(60, 2100)
+            )
+            if res.status_code == 200:
+                image_data = res.content
+            else:
+                error_msg = f"کد خطا: {res.status_code}\n{res.text[:200]}"
+
+        # ۲. اگر Pollinations بود
+        elif "pollinations.ai" in base_url:
             encoded_prompt = urllib.parse.quote(prompt_text)
-            image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            image_data = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
             if model_name and model_name.lower() != "flux":
-                image_url += f"?model={model_name}"
+                image_data += f"?model={model_name}"
+
+        # ۳. سایر سرویس‌های استاندارد بر پایه فرمت OpenAI (مثل SiliconFlow, Together)
         else:
             endpoint = base_url if base_url.endswith("/images/generations") else f"{base_url}/images/generations"
             headers = {
@@ -909,24 +948,25 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             if res.status_code == 200:
                 data = res.json()
                 if "data" in data and len(data["data"]) > 0:
-                    image_url = data["data"][0].get("url")
+                    image_data = data["data"][0].get("url")
             else:
                 error_msg = f"کد خطا: {res.status_code}\n{res.text[:200]}"
+
     except Exception as e:
         error_msg = str(e)
     finally:
         is_done = True
 
-    if image_url:
+    if image_data:
         try:
             bot.delete_message(chat_id, status_msg_id)
         except:
             pass
         caption = f"✨ **تصویر تولید شده با {active_img_model.get('name')}**\n\n📝 **پرامپت:** {prompt_text}"
         try:
-            bot.send_photo(chat_id, image_url, caption=caption, parse_mode="Markdown", message_thread_id=thread_id)
+            bot.send_photo(chat_id, image_data, caption=caption, parse_mode="Markdown", message_thread_id=thread_id)
         except:
-            bot.send_photo(chat_id, image_url, caption=caption, message_thread_id=thread_id)
+            bot.send_photo(chat_id, image_data, caption=caption, message_thread_id=thread_id)
     else:
         try:
             bot.edit_message_text(f"❌ ساخت تصویر با خطا مواجه شد.\n{error_msg or ''}", chat_id=chat_id, message_id=status_msg_id)
@@ -983,7 +1023,7 @@ def handle_all_messages(msg):
             buttons = [types.InlineKeyboardButton(f"📢 ورود به کانال {ch}", url=f"https://t.me/{ch.replace('@', '')}") for ch in unjoined]
             for i in range(0, len(buttons), 2):
                 markup.row(*buttons[i:i+2])
-            markup.add(types.InlineKeyboardButton("✅ عضو شدم / بررسی", callback_data="check_sponsor"))
+            markup.add(types.InlineKeyboardButton("✅ عضو شدم / بررسی", callback_data="check_sponsor", style="success"))
             bot.send_message(chat_id, "⚠️ برای استفاده از ربات ابتدا باید در کانال(های) اسپانسر زیر عضو شوید:", reply_markup=markup)
             return
 
@@ -993,7 +1033,7 @@ def handle_all_messages(msg):
                 return
             bot_info = bot.get_me()
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🤖 ورود به پیوی ربات", url=f"https://t.me/{bot_info.username}?start=true"))
+            markup.add(types.InlineKeyboardButton("🤖 ورود به پیوی ربات", url=f"https://t.me/{bot_info.username}?start=true", style="primary"))
             bot.reply_to(
                 msg,
                 "⚠️ **منوی تنظیمات و مدیریت ربات فقط در چت خصوصی (پیوی) قابل استفاده است.**\n\nجهت استفاده از امکانات ربات روی دکمه زیر کلیک کنید:",
@@ -1035,7 +1075,6 @@ def handle_all_messages(msg):
 
             # ۱. سکوت / بی‌صدا کردن (دائمی یا زمان‌دار: مثلاً "سکوت" یا "سکوت 10")
             if lower_text.startswith("سکوت") or lower_text.startswith("بی صدا") or lower_text.startswith("/mute"):
-                # استخراج زمان در صورت تعیین شدن (مثلاً "سکوت 15" برای ۱۵ دقیقه)
                 minutes = 0
                 match_num = re.search(r'\d+', lower_text)
                 if match_num:
@@ -1384,7 +1423,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
     elif step == "ADD_IMG_NAME":
         safe_kv_put(f"TEMP_IMG_{user_id}", {"name": text})
         safe_kv_put(f"ADMIN_STEP_{user_id}", "ADD_IMG_URL")
-        bot.send_message(chat_id, "🌐 **URL BASE** تصویرساز را وارد کنید (مثلاً `https://api.siliconflow.cn/v1`):", parse_mode="Markdown")
+        bot.send_message(chat_id, "🌐 **URL BASE** تصویرساز را وارد کنید (مثلاً `https://api.siliconflow.cn/v1` یا آدرس کامل Stability):", parse_mode="Markdown")
 
     elif step == "ADD_IMG_URL":
         temp = json.loads(safe_kv_get(f"TEMP_IMG_{user_id}") or "{}")
@@ -1398,7 +1437,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
         temp["apiKey"] = "" if text == "." else text
         safe_kv_put(f"TEMP_IMG_{user_id}", temp)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "ADD_IMG_ID")
-        bot.send_message(chat_id, "📌 **MODEL NAME** تصویرساز را وارد کنید (مثلاً `black-forest-labs/FLUX.1-schnell`):", parse_mode="Markdown")
+        bot.send_message(chat_id, "📌 **MODEL NAME** تصویرساز را وارد کنید (مثلاً `stable-image-ultra` یا `black-forest-labs/FLUX.1-schnell`):", parse_mode="Markdown")
 
     elif step == "ADD_IMG_ID":
         temp = json.loads(safe_kv_get(f"TEMP_IMG_{user_id}") or "{}")
@@ -1520,7 +1559,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
 # ==========================================
 if __name__ == "__main__":
     print("=" * 45)
-    print("🤖 Neo-AI-Bot with Group Moderation Suite Started")
+    print("🤖 Neo-AI-Bot with Native Colored Buttons & Stability Support Started")
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | SSE Streaming Active")
     print("=" * 45)
