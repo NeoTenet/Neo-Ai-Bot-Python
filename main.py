@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 Telegram AI Bot - Python + Upstash Redis (100% Safe & Stable)
-Configured for: bot-hosting.net (Docker / NAT Environment)
+Configured for: Wispbyte / bot-hosting.net (Docker / Linux Environment)
 Features:
-- Native Stability AI v2beta Support (Ultra, Core, SD3 - No 404 Error)
-- Modern Colored Buttons Injection (Primary Blue, Success Green, Danger Red)
+- Fixed Unicode SyntaxError (Replaced non-standard bullet characters with safe ASCII)
+- Native Persian/Jalali Calendar Engine (Automatic conversion to Iranian dates)
+- History Purge Suite: One-click Danger Button to clear all past sessions
+- Instant Casual Greeting Engine (Fixes 6-min thinking bug on 'سلان عشقم' etc.)
+- Strict Thought Filter: Strips <think> and internal monologues completely
+- Smart Group Photo Reply (Strict Vision analysis when replying to photos)
+- Structured Code Delivery: Concise explanation first, then code file attached as a direct reply
+- Real-Time Glitch-Free Stopwatch (Accurate wall-clock time)
+- Unified /models Hub: Independent Chat & Image Model Switcher with Live Status
+- Ultra-Fast MGET Admin Stats (< 0.2s for 50+ users)
+- Native Stability AI v2beta Support (Ultra, Core, SD3)
+- Colored Buttons (Primary Blue, Success Green, Danger Red)
 - Group Moderation Suite (Mute, Timed-Mute, Unmute, Ban, Delete) for Admins
-- Flexible Group AI Trigger ('ربات <پیام>' or direct reply)
-- Complete Image Model Editor (Full Wizard Flow)
-- Guaranteed Group & Private File-Only Code Delivery (.py, .js, .html, .cpp, .txt)
 - Anti-Clutter: No long code dumps in group or private chats
 - Strict UTF-8 Streaming Engine (No Mojibake)
-- Full Image Generation Support (Stability AI, SiliconFlow, Together, Flux)
-- TCP Keep-Alive Connection Resilience
-- Admin Broadcast Engine
-Timeout: 35 Minutes (2100s) | Updates Every 5 Seconds
+Timeout: 35 Minutes (2100s)
 Developer Channel: T.me/Neotenet
 """
 
@@ -55,6 +59,52 @@ def _custom_btn_to_dict(self):
 types.InlineKeyboardButton.to_dict = _custom_btn_to_dict
 
 # ==========================================
+# 📅 موتور تبدیل تاریخ میلادی به هجری شمسی (ایران)
+# ==========================================
+def gregorian_to_jalali(gy, gm, gd):
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    if gy > 1600:
+        jy = 979
+        gy -= 1600
+    else:
+        jy = 0
+        gy -= 621
+    gy2 = gy if gm > 2 else gy - 1
+    days = (365 * gy) + ((gy2 + 4) // 4) - ((gy2 + 100) // 100) + ((gy2 + 400) // 400) - 80 + gd + g_d_m[gm - 1]
+    jy += 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + (days // 31)
+        jd = 1 + (days % 31)
+    else:
+        jm = 7 + ((days - 186) // 30)
+        jd = 1 + ((days - 186) % 30)
+    return jy, jm, jd
+
+def get_jalali_date():
+    t = time.localtime()
+    jy, jm, jd = gregorian_to_jalali(t.tm_year, t.tm_mon, t.tm_mday)
+    return f"{jy}/{jm:02d}/{jd:02d}"
+
+def format_session_date(d_str):
+    if not d_str:
+        return get_jalali_date()
+    d_str = str(d_str).strip()
+    parts = re.split(r'[-/]', d_str)
+    if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) > 1600:
+        try:
+            jy, jm, jd = gregorian_to_jalali(int(parts[0]), int(parts[1]), int(parts[2]))
+            return f"{jy}/{jm:02d}/{jd:02d}"
+        except Exception:
+            pass
+    return d_str
+
+# ==========================================
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT TOKEN")
@@ -62,6 +112,7 @@ ADMIN_ID = str(os.getenv("ADMIN_ID", "ID ADMIN"))
 
 UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious.upstash.io")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "DATE BASE TOKEN")
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ==========================================
@@ -70,7 +121,6 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 class TCPKeepAliveAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         socket_options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-        
         if hasattr(socket, "TCP_KEEPIDLE"):
             socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5))
         elif hasattr(socket, "TCP_KEEPALIVE"):
@@ -85,7 +135,7 @@ class TCPKeepAliveAdapter(HTTPAdapter):
         super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
 
 http_session = requests.Session()
-adapter = TCPKeepAliveAdapter()
+adapter = TCPKeepAliveAdapter(pool_connections=20, pool_maxsize=50)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
@@ -132,6 +182,53 @@ def safe_kv_delete(key):
     except Exception as e:
         print(f"[Upstash Del Error {key}]: {e}")
         return False
+
+# ==========================================
+# 🧠 تشخیص هوشمند پیام‌های احوالپرسی و تصویرسازی
+# ==========================================
+def is_casual_greeting(text):
+    if not text:
+        return False
+    clean = re.sub(r'[^\w\s]', '', text).strip().lower()
+    greetings = [
+        'سلام', 'سلان', 'درود', 'خوبی', 'چطوری', 'سلام عشقم', 'سلان عشقم', 
+        'سلام داداش', 'سلام رفیق', 'سلام علیکم', 'چطوری عشقم', 'خوبی عشقم', 
+        'صبح بخیر', 'شب بخیر', 'عصر بخیر', 'سلام خوبی', 'سلان خوبی', 'hi', 'hello', 'hey'
+    ]
+    return clean in greetings or any(clean.startswith(g + " ") for g in ['سلام', 'سلان', 'درود'])
+
+def detect_image_intent(text):
+    if not text:
+        return False, ""
+    clean = text.strip()
+    lower = clean.lower()
+
+    en_triggers = ["draw", "paint", "generate", "create image", "create photo", "create picture", "image of", "photo of", "picture of", "imagine"]
+    if any(t in lower for t in en_triggers) or lower.endswith(" make") or lower.startswith("make ") or lower.endswith(" image") or lower.endswith(" photo") or lower.endswith(" picture"):
+        prompt = re.sub(r'^(?:please\s+)?(?:make|draw|paint|generate|create|imagine)\s+(?:a|an|the)?\s*(?:image|photo|picture)?\s*(?:of)?\s*', '', clean, flags=re.IGNORECASE)
+        prompt = re.sub(r'\s+(?:make|image|photo|picture)$', '', prompt, flags=re.IGNORECASE)
+        return True, prompt.strip() or clean
+
+    fa_keywords = ["عکس", "تصویر", "نقاشی", "پوستر", "والپیپر", "طرح"]
+    fa_actions = ["بساز", "بکش", "تولید کن", "طراحی کن", "بده", "درست کن", "میخوام", "می‌خوام"]
+
+    has_fa_keyword = any(k in clean for k in fa_keywords)
+    has_fa_action = any(a in clean for a in fa_actions)
+
+    if has_fa_keyword and has_fa_action:
+        prompt = clean
+        prompt = re.sub(r'(?:لطفاً|لطفا|بی زحمت|برام|برای من|یه|یک)\s+', '', prompt)
+        prompt = re.sub(r'(?:عکس|تصویر|نقاشی|پوستر|والپیپر)\s+(?:از|بکش\s+از|بساز\s+از|تولید\s+کن\s+از)?\s*', '', prompt)
+        prompt = re.sub(r'\s+(?:عکس|تصویر|نقاشی)?\s*(?:بساز|بکش|تولید کن|طراحی کن|بده|درست کن)$', '', prompt)
+        prompt = re.sub(r'^(?:از)\s+', '', prompt)
+        return True, prompt.strip() or clean
+
+    if has_fa_action and any(clean.startswith(a + " ") or clean.endswith(" " + a) for a in ["بساز", "بکش", "تولید کن"]):
+        prompt = re.sub(r'^(?:بساز|بکش|تولید کن)\s*', '', clean)
+        prompt = re.sub(r'\s*(?:بساز|بکش|تولید کن)$', '', prompt)
+        return True, prompt.strip() or clean
+
+    return False, clean
 
 # ==========================================
 # توابع بررسی دسترسی و مدیریت کاربر
@@ -191,7 +288,7 @@ def get_or_create_active_session(user_id):
         active_id = f"sess_{int(time.time())}"
         safe_kv_put(f"ACTIVE_SESSION_{user_id}", active_id)
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
-        sessions.insert(0, {"id": active_id, "title": "گفتگوی جدید 💬", "date": time.strftime("%Y/%m/%d")})
+        sessions.insert(0, {"id": active_id, "title": "گفتگوی جدید 💬", "date": get_jalali_date()})
         safe_kv_put(f"SESSIONS_{user_id}", sessions)
     return active_id
 
@@ -204,14 +301,14 @@ def update_session_title_if_new(user_id, session_id, first_msg):
             break
 
 def is_code_request(text):
-    if not text:
+    if not text or is_casual_greeting(text):
         return False
     lower = text.lower()
     code_keywords = [
         'code', 'script', 'bug', 'error', 'function', 'const', 'let', 'var', 
         'import', 'export', 'def', 'class', 'html', 'css', 'js', 'python', 
         'c++', 'java', 'sql', 'json', 'async', 'await', 'return', 'if', 'else',
-        'کد', 'برنامه', 'اسکریپت', 'باگ', 'خطا', 'دیباگ', 'خط', 'توابع', 'متغیر', 'ارور', 'بساز', 'بنویس'
+        'کد', 'برنامه', 'اسکریپت', 'باگ', 'خطا', 'دیباگ', 'توابع', 'متغیر', 'ارور'
     ]
     return any(k in lower for k in code_keywords)
 
@@ -251,34 +348,25 @@ def send_safe_ai_response(chat_id, message_id, text, reply_to_id=None, thread_id
                 )
 
 # ==========================================
-# 📁 سیستم تفکیک کد از متن و ساخت فایل
+# 📁 سیستم تفکیک کد از متن و فیلتر تمیز
 # ==========================================
 def process_code_and_text(raw_text, is_code_prompt):
     pattern = r'```([a-zA-Z0-9_+-]*)[^\n]*\r?\n([\s\S]*?)```'
     matches = re.findall(pattern, raw_text)
-    
     code_files = []
 
     ext_map = {
-        'python': 'py', 'py': 'py',
-        'javascript': 'js', 'js': 'js',
-        'typescript': 'ts', 'ts': 'ts',
-        'html': 'html', 'css': 'css',
-        'cpp': 'cpp', 'c++': 'cpp', 'c': 'c',
-        'java': 'java', 'kotlin': 'kt',
-        'php': 'php', 'sql': 'sql',
-        'json': 'json', 'xml': 'xml',
-        'bash': 'sh', 'sh': 'sh', 'shell': 'sh',
-        'go': 'go', 'golang': 'go',
-        'rust': 'rs', 'rs': 'rs',
-        'lua': 'lua', 'csharp': 'cs', 'cs': 'cs',
-        'ruby': 'rb', 'rb': 'rb',
-        'swift': 'swift', 'dart': 'dart',
-        'yaml': 'yml', 'yml': 'yml',
-        'txt': 'txt', 'text': 'txt'
+        'python': 'py', 'py': 'py', 'javascript': 'js', 'js': 'js',
+        'typescript': 'ts', 'ts': 'ts', 'html': 'html', 'css': 'css',
+        'cpp': 'cpp', 'c++': 'cpp', 'c': 'c', 'java': 'java', 'kotlin': 'kt',
+        'php': 'php', 'sql': 'sql', 'json': 'json', 'xml': 'xml',
+        'bash': 'sh', 'sh': 'sh', 'shell': 'sh', 'go': 'go', 'golang': 'go',
+        'rust': 'rs', 'rs': 'rs', 'lua': 'lua', 'csharp': 'cs', 'cs': 'cs',
+        'ruby': 'rb', 'rb': 'rb', 'swift': 'swift', 'dart': 'dart', 'txt': 'txt'
     }
 
     if matches:
+        detected_lang_name = "کد"
         for idx, (lang, code_content) in enumerate(matches, 1):
             clean_code = code_content.strip()
             if len(clean_code) < 10:
@@ -296,6 +384,7 @@ def process_code_and_text(raw_text, is_code_prompt):
             else:
                 ext = 'txt'
 
+            detected_lang_name = ext.upper()
             if ext == 'py':
                 filename = "main.py" if idx == 1 else f"script_{idx}.py"
             elif ext == 'js':
@@ -309,16 +398,13 @@ def process_code_and_text(raw_text, is_code_prompt):
 
             code_files.append((filename, clean_code.encode('utf-8'), ext))
 
-        def clean_replacer(match):
-            lang = match.group(1).strip()
-            lang_display = lang.upper() if lang else "کد"
-            return f"\n\n📦 **[سورس {lang_display} در فایل زیر ضمیمه شد]**\n"
+        cleaned_text = re.sub(pattern, '', raw_text).strip()
+        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text).strip()
 
-        cleaned_text = re.sub(pattern, clean_replacer, raw_text).strip()
-
-        check_empty = re.sub(r'📦 \*\*\[سورس .*? ضمیمه شد\]\*\*', '', cleaned_text).strip()
-        if len(check_empty) < 10:
-            cleaned_text = "✅ **کد درخواستی شما با موفقیت تولید شد و در فایل زیر ضمیمه گردید:**"
+        if len(cleaned_text) > 10:
+            cleaned_text += f"\n\n📦 **سورس کد {detected_lang_name} در فایل زیر ضمیمه و ریپلای شد 👇**"
+        else:
+            cleaned_text = f"✅ **توضیحات و سورس کد {detected_lang_name} آماده شد و در فایل زیر ضمیمه گردید 👇**"
 
         return cleaned_text, code_files
 
@@ -340,7 +426,7 @@ def process_code_and_text(raw_text, is_code_prompt):
             filename = "script.txt"
 
         code_files.append((filename, raw_text.encode('utf-8'), ext))
-        cleaned_text = "✅ **کد درخواستی شما با موفقیت آماده شد و در فایل زیر ضمیمه گردید:**"
+        cleaned_text = "✅ **سورس کد برنامه با موفقیت آماده شد و در فایل زیر ضمیمه گردید 👇**"
         return cleaned_text, code_files
 
     return raw_text, []
@@ -387,7 +473,7 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         return False
 
 # ==========================================
-# ۱. رابط کاربری منوی اصلی (با استایل رنگی تزریق‌شده)
+# ۱. رابط کاربری و هاب جامع انتخاب مدل‌ها (/models)
 # ==========================================
 def get_main_menu_markup(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -396,7 +482,7 @@ def get_main_menu_markup(user_id):
         types.InlineKeyboardButton("🎨 تصویرسازی هوش مصنوعی", callback_data="mode_image", style="success")
     )
     markup.add(
-        types.InlineKeyboardButton("🤖 انتخاب مدل هوش مصنوعی", callback_data="select_model_menu"),
+        types.InlineKeyboardButton("🤖 انتخاب مدل هوش مصنوعی", callback_data="models_hub"),
         types.InlineKeyboardButton("📜 تاریخچه گفتگوها", callback_data="history_menu")
     )
     row3 = [types.InlineKeyboardButton("➕ شروع گفتگوی جدید", callback_data="new_chat", style="success")]
@@ -424,7 +510,7 @@ def send_history_menu(chat_id, user_id):
     buttons = []
     for s in sessions[:10]:
         is_cur = "🟢 " if s.get("id") == active_sess else "💬 "
-        date_str = s.get("date", "")
+        date_str = format_session_date(s.get("date"))
         title = f"{is_cur}{s.get('title')} [{date_str}]"
         buttons.append(types.InlineKeyboardButton(title, callback_data=f"switch_sess_{s.get('id')}"))
 
@@ -433,17 +519,56 @@ def send_history_menu(chat_id, user_id):
 
     markup.add(
         types.InlineKeyboardButton("➕ ایجاد چت جدید", callback_data="new_chat", style="success"),
+        types.InlineKeyboardButton("🗑 حذف کل تاریخچه", callback_data="clear_all_history", style="danger")
+    )
+    markup.add(
         types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")
     )
     bot.send_message(chat_id, "📜 **لیست گفتگوهای قبلی شما:**", parse_mode="Markdown", reply_markup=markup)
 
-def send_model_selection_menu(chat_id, target_key_id):
-    models = json.loads(safe_kv_get("AI_MODELS") or "[]")
-    current_idx = safe_kv_get(f"USER_MODEL_{target_key_id}") or "0"
+def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
+    keys = ["AI_MODELS", "IMAGE_MODELS", f"USER_MODEL_{target_key_id}", f"USER_IMG_MODEL_{target_key_id}"]
+    res = upstash_command(["MGET"] + keys) or [None, None, None, None]
 
-    if not models:
-        bot.send_message(chat_id, "⚠️ هیچ مدلی تعریف نشده است.")
-        return
+    chat_models = json.loads(res[0] or "[]")
+    img_models = json.loads(res[1] or "[]")
+    cur_chat_idx = int(res[2] or "0")
+    cur_img_idx = int(res[3] or "0")
+
+    chat_name = chat_models[cur_chat_idx].get("name") if cur_chat_idx < len(chat_models) else "تعریف نشده"
+    img_name = img_models[cur_img_idx].get("name") if cur_img_idx < len(img_models) else "تعریف نشده"
+
+    text = (
+        "✨ **منوی جامع مدیریت مدل‌های هوش مصنوعی**\n\n"
+        f"💬 مدل فعال چت: **{chat_name}**\n"
+        f"🎨 مدل فعال عکس: **{img_name}**\n\n"
+        "بخش مورد نظر را برای انتخاب یا تغییر انتخاب کنید:"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("💬 مدل‌های چت و کدنویسی", callback_data="models_cat_chat", style="primary"),
+        types.InlineKeyboardButton("🎨 مدل‌های ساخت عکس", callback_data="models_cat_image", style="success")
+    )
+    if is_group:
+        markup.add(types.InlineKeyboardButton("❌ بستن منو", callback_data="close_menu", style="danger"))
+    else:
+        markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu"))
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+
+def build_model_selection_markup(target_key_id, is_group=False, models=None, current_idx=None):
+    if models is None or current_idx is None:
+        keys = ["AI_MODELS", f"USER_MODEL_{target_key_id}"]
+        res = upstash_command(["MGET"] + keys) or [None, None]
+        models = json.loads(res[0] or "[]")
+        current_idx = res[1] or "0"
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
@@ -456,16 +581,15 @@ def send_model_selection_menu(chat_id, target_key_id):
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i+2])
 
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu"))
-    bot.send_message(chat_id, "✨ **مدل هوش مصنوعی چت را انتخاب کنید:**", parse_mode="Markdown", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی مدل‌ها", callback_data="models_hub"))
+    return markup
 
-def send_image_model_selection_menu(chat_id, user_id):
-    img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
-    current_idx = safe_kv_get(f"USER_IMG_MODEL_{user_id}") or "0"
-
-    if not img_models:
-        bot.send_message(chat_id, "⚠️ هیچ مدل تصویرسازی تعریف نشده است.")
-        return
+def build_image_model_selection_markup(target_key_id, is_group=False, img_models=None, current_idx=None):
+    if img_models is None or current_idx is None:
+        keys = ["IMAGE_MODELS", f"USER_IMG_MODEL_{target_key_id}"]
+        res = upstash_command(["MGET"] + keys) or [None, None]
+        img_models = json.loads(res[0] or "[]")
+        current_idx = res[1] or "0"
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
@@ -476,11 +600,25 @@ def send_image_model_selection_menu(chat_id, user_id):
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i+2])
 
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu"))
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی مدل‌ها", callback_data="models_hub"))
+    return markup
+
+def send_image_model_selection_menu(chat_id, user_id, is_group=False):
+    target_key = f"group_{chat_id}" if is_group else user_id
+    keys = ["IMAGE_MODELS", f"USER_IMG_MODEL_{target_key}"]
+    res = upstash_command(["MGET"] + keys) or [None, None]
+    img_models = json.loads(res[0] or "[]")
+
+    if not img_models:
+        bot.send_message(chat_id, "⚠️ هیچ مدل تصویرسازی تعریف نشده است.")
+        return
+
+    current_idx = res[1] or "0"
+    markup = build_image_model_selection_markup(target_key, is_group, img_models, current_idx)
     bot.send_message(chat_id, "🎨 **مدل ساخت عکس را انتخاب کنید:**", parse_mode="Markdown", reply_markup=markup)
 
 # ==========================================
-# ۲. پنل مدیریت ادمین (دکمه‌های رنگی)
+# ۲. پنل مدیریت ادمین (آمار فوق‌العاده سریع با MGET)
 # ==========================================
 def get_admin_panel_markup():
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -511,16 +649,23 @@ def get_admin_panel_markup():
 
 def send_bot_stats(chat_id):
     users = json.loads(safe_kv_get("BOT_USERS") or "[]")
+    total_users = len(users)
+
     now_ms = int(time.time() * 1000)
     day_ms = 24 * 60 * 60 * 1000
     active_count = 0
 
-    for u in users:
-        last = safe_kv_get(f"LAST_ACTIVE_{u}")
-        if last and (now_ms - int(last)) < day_ms:
-            active_count += 1
+    if users:
+        keys = [f"LAST_ACTIVE_{u}" for u in users]
+        for i in range(0, len(keys), 100):
+            batch_keys = keys[i:i+100]
+            res = upstash_command(["MGET"] + batch_keys)
+            if res and isinstance(res, list):
+                for val in res:
+                    if val and str(val).isdigit() and (now_ms - int(val)) < day_ms:
+                        active_count += 1
 
-    text = f"📊 **آمار جامع کاربران ربات:**\n\n👥 کل کاربران ثبت‌نامی: **{len(users)}**\n🟢 کاربران آنلاین / فعال (۲۴ ساعت گذشته): **{active_count}**"
+    text = f"📊 **آمار جامع کاربران ربات:**\n\n👥 کل کاربران ثبت‌نامی: **{total_users}**\n🟢 کاربران آنلاین / فعال (۲۴ ساعت گذشته): **{active_count}**"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel", style="primary"))
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
@@ -621,7 +766,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     bot.send_message(chat_id, list_text, reply_markup=markup)
 
 # ==========================================
-# ۳. پردازش چت با Streaming، دیکود UTF-8 و ارسال قطعی فایل در گروه و پیوی
+# ۳. پردازش چت هوش مصنوعی (بدون نشت افکار + پاسخ آنی احوالپرسی)
 # ==========================================
 def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id, thread_id=None):
     models = json.loads(safe_kv_get("AI_MODELS") or "[]")
@@ -639,15 +784,17 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
     active_model = models[model_idx]
     if not text_prompt:
-        text_prompt = "لطفاً بررسی کن یا پاسخ بده."
+        text_prompt = "سلام"
+        
     is_code = is_code_request(text_prompt)
+    is_greeting = is_casual_greeting(text_prompt)
 
     req_id = f"{user_id}_{int(time.time()*1000)}"
     cancel_markup = types.InlineKeyboardMarkup()
     cancel_markup.add(types.InlineKeyboardButton("❌ لغو و توقف فکر کردن", callback_data=f"cancel_req_{req_id}", style="danger"))
 
     reply_to = target_reply_id if target_reply_id else (message.message_id if is_group else None)
-    initial_text = "💻 در حال نوشتن و آماده‌سازی فایل کد... (۵ ثانیه)" if is_code else "🧠 در حال فکر کردن و ارتباط با API... (۵ ثانیه)"
+    initial_text = "💻 در حال آماده‌سازی کد... ⏱️ 00:00" if is_code else "🧠 در حال پردازش و پاسخ... ⏱️ 00:00"
 
     try:
         status_msg = bot.send_message(
@@ -663,36 +810,35 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
     status_msg_id = status_msg.message_id
     is_done = False
     api_response_text = None
+    start_time = time.time()
 
     def timer_loop():
-        sec = 5
-        while not is_done and sec < 2100:
-            time.sleep(5)
-            if is_done:
+        last_edit_time = 0
+        while not is_done:
+            time.sleep(0.5)
+            if is_done or safe_kv_get(f"CANCEL_{req_id}") == "true":
                 break
-            if safe_kv_get(f"CANCEL_{req_id}") == "true":
+
+            now = time.time()
+            elapsed = int(now - start_time)
+            if elapsed >= 2100:
                 break
-            sec += 5
-            try:
-                bot.send_chat_action(chat_id, "typing")
-            except:
-                pass
 
-            mins = sec // 60
-            secs = sec % 60
-            if mins > 0:
-                time_display = f"{mins} دقیقه و {secs} ثانیه" if secs > 0 else f"{mins} دقیقه"
-            else:
-                time_display = f"{secs} ثانیه"
+            if now - last_edit_time >= 2:
+                mins = elapsed // 60
+                secs = elapsed % 60
+                time_display = f"{mins:02d}:{secs:02d}"
 
-            cur_txt = f"💻 در حال پردازش و تولید فایل کد... ({time_display})" if is_code else f"🧠 در حال دریافت و تحلیل هوش مصنوعی... ({time_display})"
-            try:
-                bot.edit_message_text(cur_txt, chat_id=chat_id, message_id=status_msg_id, reply_markup=cancel_markup)
-            except ApiTelegramException as te:
-                if te.error_code == 429:
-                    time.sleep(te.result_json.get('parameters', {}).get('retry_after', 3))
-            except Exception:
-                pass
+                cur_txt = f"💻 در حال آماده‌سازی کد... ⏱️ {time_display}" if is_code else f"🧠 در حال پردازش و پاسخ... ⏱️ {time_display}"
+                try:
+                    bot.edit_message_text(cur_txt, chat_id=chat_id, message_id=status_msg_id, reply_markup=cancel_markup)
+                    last_edit_time = now
+                except ApiTelegramException as te:
+                    if te.error_code == 429:
+                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
+                        last_edit_time = now + wait_time
+                except Exception:
+                    pass
 
     t_thread = threading.Thread(target=timer_loop, daemon=True)
     t_thread.start()
@@ -718,28 +864,38 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
         history.append({"role": "user", "content": user_content})
 
-        cleaned_messages = []
-        for idx, item in enumerate(history):
-            if idx < len(history) - 1 and isinstance(item.get("content"), list):
-                txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "تصویر قبلی")
-                cleaned_messages.append({"role": item["role"], "content": f"[تصویر ارسال شده: {txt_part}]"})
-            else:
-                cleaned_messages.append(item)
+        if is_greeting:
+            cleaned_messages = [{"role": "user", "content": text_prompt}]
+        else:
+            cleaned_messages = []
+            for idx, item in enumerate(history):
+                if idx < len(history) - 1 and isinstance(item.get("content"), list):
+                    txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "تصویر قبلی")
+                    cleaned_messages.append({"role": item["role"], "content": f"[تصویر ارسال شده: {txt_part}]"})
+                else:
+                    cleaned_messages.append(item)
 
-        while cleaned_messages and cleaned_messages[0].get("role") == "assistant":
-            cleaned_messages.pop(0)
-
-        if len(cleaned_messages) > 10:
-            cleaned_messages = cleaned_messages[-10:]
-            if cleaned_messages and cleaned_messages[0].get("role") == "assistant":
+            while cleaned_messages and cleaned_messages[0].get("role") == "assistant":
                 cleaned_messages.pop(0)
+
+            if len(cleaned_messages) > 4:
+                cleaned_messages = cleaned_messages[-4:]
+                if cleaned_messages and cleaned_messages[0].get("role") == "assistant":
+                    cleaned_messages.pop(0)
 
         base_url = active_model.get("baseUrl", "").strip().rstrip("/")
         endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
 
         system_prompt = {
             "role": "system",
-            "content": "You are an expert AI software engineer. Whenever code is requested, ALWAYS enclose the complete code inside markdown codeblocks with the proper language tag (e.g. ```python\\n...\\n```). Provide a clean, brief summary."
+            "content": (
+                f"You are {active_model.get('name')}, a smart and friendly AI assistant. "
+                "CRITICAL RULES:\n"
+                "1. Always reply in clean, natural Persian directly to the user.\n"
+                "2. NEVER output English internal monologue, notes, or meta-analysis. Never reveal your chain of thought.\n"
+                "3. If the user greets you, reply with an affectionate, natural, friendly Persian greeting immediately. Do NOT write code unless explicitly requested in the CURRENT message.\n"
+                "4. When code is explicitly requested, provide a brief, concise Persian explanation first, then the complete code inside markdown codeblocks."
+            )
         }
 
         payload = {
@@ -792,7 +948,13 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                         except Exception:
                             continue
 
-                api_response_text = full_content if full_content.strip() else full_reasoning
+                clean_c = re.sub(r'<think>[\s\S]*?</think>', '', full_content, flags=re.IGNORECASE).strip()
+                if clean_c:
+                    api_response_text = clean_c
+                elif full_content.strip():
+                    api_response_text = full_content.strip()
+                else:
+                    api_response_text = re.sub(r'<think>[\s\S]*?</think>', '', full_reasoning, flags=re.IGNORECASE).strip()
             else:
                 try:
                     data = res.json()
@@ -802,14 +964,21 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 msg_obj = data.get("choices", [{}])[0].get("message", {})
                 c = msg_obj.get("content", "")
                 r = msg_obj.get("reasoning_content", "")
-                api_response_text = c if (c and c.strip()) else r
+                
+                clean_c = re.sub(r'<think>[\s\S]*?</think>', '', c, flags=re.IGNORECASE).strip()
+                api_response_text = clean_c if clean_c else (c if c.strip() else r)
         else:
             api_response_text = f"❌ خطای سرور API (کد {res.status_code}):\n{res.text[:250]}"
 
+        if api_response_text:
+            api_response_text = re.sub(r'<think>[\s\S]*?</think>', '', api_response_text, flags=re.IGNORECASE).strip()
+
         if api_response_text and not api_response_text.startswith("❌"):
-            history.append({"role": "assistant", "content": api_response_text})
+            clean_text, code_files = process_code_and_text(api_response_text, is_code)
+
+            history.append({"role": "assistant", "content": clean_text[:800]})
             hist_to_save = []
-            for item in history[-12:]:
+            for item in history[-6:]:
                 if isinstance(item.get("content"), list):
                     txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "تصویر")
                     hist_to_save.append({"role": item["role"], "content": txt_part})
@@ -830,25 +999,22 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         safe_kv_delete(f"CANCEL_{req_id}")
 
     if api_response_text and not api_response_text.startswith("❌"):
-        clean_text, code_files = process_code_and_text(api_response_text, is_code)
-
+        # جایگزینی کاراکتر خطایونیکد با علامت امن |
         if is_group:
             sender_name = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "کاربر")
-            final_text = f"👤 کاربر: {sender_name}\n🤖 مدل: {active_model.get('name')}\n-------------------\n\n{clean_text}"
+            final_text = f"👤 **کاربر:** {sender_name} | 🤖 **مدل:** {active_model.get('name')}\n\n{clean_text}"
         else:
             final_text = clean_text
 
-        # ۱. ارسال متن تمیز خلاصه در گروه یا پیوی
         send_safe_ai_response(chat_id, status_msg_id, final_text, reply_to, thread_id)
         
-        # ۲. ارسال سورس کد فقط و فقط در قالب فایل دانلودی در همان چت
         for filename, byte_data, ext in code_files:
             send_code_document_safe(
                 chat_id=chat_id,
                 byte_data=byte_data,
                 filename=filename,
                 ext=ext,
-                reply_to_id=reply_to,
+                reply_to_id=status_msg_id,
                 thread_id=thread_id
             )
     else:
@@ -859,7 +1025,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 pass
 
 # ==========================================
-# ۴. پردازش ساخت عکس (پشتیبانی اختصاصی از Stability AI و سایر سرویس‌ها)
+# ۴. پردازش ساخت عکس (کرنومتر زنده)
 # ==========================================
 def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None):
     img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
@@ -874,29 +1040,38 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         return
 
     active_img_model = img_models[img_idx]
-    status_msg = bot.send_message(chat_id, "🎨 در حال ساخت تصویر... (۵ ثانیه)", message_thread_id=thread_id)
+    status_msg = bot.send_message(chat_id, f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00", message_thread_id=thread_id)
     status_msg_id = status_msg.message_id
     is_done = False
     image_data = None
     error_msg = None
+    start_time = time.time()
 
     def timer_loop():
-        sec = 5
-        while not is_done and sec < 2100:
-            time.sleep(5)
+        last_edit_time = 0
+        while not is_done:
+            time.sleep(0.5)
             if is_done:
                 break
-            sec += 5
-            mins = sec // 60
-            secs = sec % 60
-            time_display = f"{mins} دقیقه و {secs} ثانیه" if secs > 0 else f"{secs} ثانیه"
-            try:
-                bot.edit_message_text(f"🎨 در حال ساخت تصویر و رندر... ({time_display})", chat_id=chat_id, message_id=status_msg_id)
-            except ApiTelegramException as te:
-                if te.error_code == 429:
-                    time.sleep(te.result_json.get('parameters', {}).get('retry_after', 3))
-            except Exception:
-                pass
+
+            now = time.time()
+            elapsed = int(now - start_time)
+            if elapsed >= 2100:
+                break
+
+            if now - last_edit_time >= 2:
+                mins = elapsed // 60
+                secs = elapsed % 60
+                time_display = f"{mins:02d}:{secs:02d}"
+                try:
+                    bot.edit_message_text(f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}", chat_id=chat_id, message_id=status_msg_id)
+                    last_edit_time = now
+                except ApiTelegramException as te:
+                    if te.error_code == 429:
+                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
+                        last_edit_time = now + wait_time
+                except Exception:
+                    pass
 
     threading.Thread(target=timer_loop, daemon=True).start()
 
@@ -905,7 +1080,6 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         api_key = active_img_model.get("apiKey", "").strip()
         model_name = active_img_model.get("modelName", "").strip()
 
-        # ۱. اگر سرور Stability AI بود (جلوگیری از ارور ۴۰۴ با ارسال Multipart Form-data)
         if "stability.ai" in base_url:
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -923,14 +1097,12 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             else:
                 error_msg = f"کد خطا: {res.status_code}\n{res.text[:200]}"
 
-        # ۲. اگر Pollinations بود
         elif "pollinations.ai" in base_url:
             encoded_prompt = urllib.parse.quote(prompt_text)
             image_data = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
             if model_name and model_name.lower() != "flux":
                 image_data += f"?model={model_name}"
 
-        # ۳. سایر سرویس‌های استاندارد بر پایه فرمت OpenAI (مثل SiliconFlow, Together)
         else:
             endpoint = base_url if base_url.endswith("/images/generations") else f"{base_url}/images/generations"
             headers = {
@@ -974,7 +1146,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             pass
 
 # ==========================================
-# ۵. هندلر پیام‌ها و رویدادهای تلگرام (دستورات مدیریتی گروه + چت هوش مصنوعی)
+# ۵. هندلر پیام‌ها و رویدادهای تلگرام
 # ==========================================
 @bot.message_handler(content_types=['text', 'photo', 'document', 'video', 'audio', 'voice'])
 def handle_all_messages(msg):
@@ -1005,7 +1177,6 @@ def handle_all_messages(msg):
         bot.send_message(chat_id, "⛔ حساب شما توسط مدیریت مسدود شده است.", message_thread_id=thread_id)
         return
 
-    # دستورات چت خصوصی ادمین
     if not is_group:
         admin_step = safe_kv_get(f"ADMIN_STEP_{user_id}")
         if admin_step and user_id == ADMIN_ID:
@@ -1049,14 +1220,14 @@ def handle_all_messages(msg):
     if text.startswith("/models"):
         if is_group:
             if not is_group_admin(chat_id, user_id):
-                bot.reply_to(msg, "⛔ تغییر مدل ربات در گروه فقط توسط ادمین‌های گروه مجاز است.", allow_sending_without_reply=True)
+                bot.reply_to(msg, "⛔ تغییر مدل‌های ربات در گروه فقط توسط ادمین‌های گروه مجاز است.", allow_sending_without_reply=True)
                 return
         elif ADMIN_ID and user_id != ADMIN_ID:
             bot.send_message(chat_id, "⛔ این دستور تنها برای ادمین ربات مجاز است.")
             return
 
         target_key = f"group_{chat_id}" if is_group else user_id
-        send_model_selection_menu(chat_id, target_key)
+        send_models_hub(chat_id, target_key, is_group)
         return
 
     target_reply_id = msg.message_id
@@ -1065,15 +1236,11 @@ def handle_all_messages(msg):
         bot_id = str(bot_info.id)
         lower_text = text.lower().strip()
 
-        # ==========================================
-        # 👮 دستورات ناظمی و مدیریتی گروه ویژه ادمین‌ها
-        # ==========================================
         if is_group_admin(chat_id, user_id) and msg.reply_to_message:
             target_user = msg.reply_to_message.from_user
             target_uid = target_user.id
             target_name = target_user.first_name or "کاربر"
 
-            # ۱. سکوت / بی‌صدا کردن (دائمی یا زمان‌دار: مثلاً "سکوت" یا "سکوت 10")
             if lower_text.startswith("سکوت") or lower_text.startswith("بی صدا") or lower_text.startswith("/mute"):
                 minutes = 0
                 match_num = re.search(r'\d+', lower_text)
@@ -1091,11 +1258,10 @@ def handle_all_messages(msg):
                     )
                     time_msg = f"به مدت **{minutes} دقیقه**" if minutes > 0 else "**به صورت دائم**"
                     bot.reply_to(msg, f"🔇 کاربر [{target_name}](tg://user?id={target_uid}) {time_msg} در گروه بی‌صدا شد.", parse_mode="Markdown")
-                except Exception as e:
-                    bot.reply_to(msg, f"❌ خطای محدودسازی: دسترسی ادمینی ربات را در گروه بررسی کنید.")
+                except Exception:
+                    bot.reply_to(msg, "❌ خطای محدودسازی: دسترسی ادمینی ربات را در گروه بررسی کنید.")
                 return
 
-            # ۲. رفع سکوت
             elif lower_text in ["رفع سکوت", "ازاد", "آزاد", "/unmute"]:
                 try:
                     bot.restrict_chat_member(
@@ -1113,7 +1279,6 @@ def handle_all_messages(msg):
                     bot.reply_to(msg, "❌ خطا در رفع محدودیت.")
                 return
 
-            # ۳. اخراج / بن کاربر
             elif lower_text in ["اخراج", "بن", "بلاک", "/ban", "/kick"]:
                 try:
                     bot.ban_chat_member(chat_id, target_uid)
@@ -1122,7 +1287,6 @@ def handle_all_messages(msg):
                     bot.reply_to(msg, "❌ خطا در اخراج کاربر (ربات نمی‌تواند ادمین‌ها را اخراج کند).")
                 return
 
-            # ۴. حذف پیام
             elif lower_text in ["حذف", "پاک", "دلیت", "/del"]:
                 try:
                     bot.delete_message(chat_id, msg.reply_to_message.message_id)
@@ -1131,7 +1295,6 @@ def handle_all_messages(msg):
                     pass
                 return
 
-        # دستورات وضعیت آنلاین و سکوت کلی ربات در گروه
         admin_cmds = ["/bot", "bot", "/bot test", "bot test", "/bot سکوت", "bot سکوت", "/bot صحبت", "bot صحبت", "/bot راهنما", "bot راهنما"]
         if any(lower_text == c or lower_text.startswith(c + " ") for c in admin_cmds):
             if not is_group_admin(chat_id, user_id):
@@ -1155,7 +1318,8 @@ def handle_all_messages(msg):
                     "📌 **دستورات مدیریتی ویژه ادمین:**\n"
                     "🔹 `/bot test` ➔ بررسی وضعیت آنلاین بودن ربات\n"
                     "🔹 `/bot سکوت` ➔ متوقف کردن موقت پاسخگویی ربات\n"
-                    "🔹 `/bot صحبت` ➔ فعال‌سازی مجدد ربات در گروه\n\n"
+                    "🔹 `/bot صحبت` ➔ فعال‌سازی مجدد ربات در گروه\n"
+                    "🔹 `/models` ➔ انتخاب مدل چت و مدل عکس گروه\n\n"
                     "👮 **دستورات ناظمی (ریپلای روی پیام کاربر):**\n"
                     "🔸 `سکوت` یا `سکوت 10` ➔ بی‌صدا کردن کاربر\n"
                     "🔸 `رفع سکوت` یا `آزاد` ➔ لغو محدودیت کاربر\n"
@@ -1170,7 +1334,6 @@ def handle_all_messages(msg):
 
         is_reply_to_bot = msg.reply_to_message and str(msg.reply_to_message.from_user.id) == bot_id
 
-        # الگوی هوشمند برای تشخیص انواع نگارش کلمه "ربات"، "روبات" یا "بات"
         robot_pattern = r'^(ربات|روبات|بات)[\s:,،\n]+(.*)$'
         robot_match = re.match(robot_pattern, text.strip(), flags=re.IGNORECASE | re.DOTALL)
         is_exact_robot_call = text.strip() in ["ربات", "روبات", "بات"]
@@ -1193,18 +1356,31 @@ def handle_all_messages(msg):
                 msg.photo = msg.reply_to_message.photo
 
             prompt_inst = text.strip() if text.strip() else "لطفاً بررسی کن و پاسخ کامل بده."
-            text = f'[پیام اصلی کاربر ({target_name}): "{replied_text or "تصویر/فایل بدون متن"}" ]\n\nدستور/سوال درباره این پیام:\n{prompt_inst}'
+            
+            if msg.reply_to_message.photo:
+                text = f"پاسخ به عکس ارسالی ({target_name}): {prompt_inst}"
+            else:
+                text = f'[پیام ({target_name}): "{replied_text}"]\n\nدستور:\n{prompt_inst}'
 
     target_key_id = f"group_{chat_id}" if is_group else user_id
-    user_mode = safe_kv_get(f"USER_MODE_{target_key_id}") or "CHAT"
 
-    if user_mode == "IMAGE_GEN":
-        threading.Thread(target=worker_image_process, args=(chat_id, user_id, text, target_key_id, thread_id), daemon=True).start()
+    has_photo_attached = bool(msg.photo or (msg.reply_to_message and msg.reply_to_message.photo))
+    user_forced_mode = safe_kv_get(f"USER_MODE_{target_key_id}")
+    
+    is_img_prompt = False
+    clean_img_prompt = text
+
+    if not has_photo_attached:
+        is_img_prompt, clean_img_prompt = detect_image_intent(text)
+
+    if is_img_prompt or (user_forced_mode == "IMAGE_GEN" and not has_photo_attached):
+        img_prompt_to_use = clean_img_prompt if is_img_prompt else text
+        threading.Thread(target=worker_image_process, args=(chat_id, user_id, img_prompt_to_use, target_key_id, thread_id), daemon=True).start()
     else:
         threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id), daemon=True).start()
 
 # ==========================================
-# ۶. هندلر دکمه‌های شیشه‌ای (Callback Queries)
+# ۶. هندلر دکمه‌های شیشه‌ای و سوییچ لحظه‌ای
 # ==========================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(query):
@@ -1230,13 +1406,15 @@ def handle_callbacks(query):
         return
 
     if is_group:
-        settings_btns = ["mode_chat", "mode_image", "select_model_menu"]
-        if data in settings_btns or data.startswith("set_model_") or data.startswith("set_img_model_"):
+        group_allowed_actions = ["models_hub", "models_cat_chat", "models_cat_image", "close_menu"]
+        is_set_action = data.startswith("set_model_") or data.startswith("set_img_model_")
+
+        if data in group_allowed_actions or is_set_action:
             if not is_group_admin(chat_id, user_id):
-                bot.answer_callback_query(query.id, "⛔ تغییر تنظیمات ربات در گروه فقط توسط ادمین امکان‌پذیر است!", show_alert=True)
+                bot.answer_callback_query(query.id, "⛔ تغییر مدل‌های ربات در گروه فقط توسط ادمین امکان‌پذیر است!", show_alert=True)
                 return
 
-        pv_only = ["main_menu", "check_sponsor", "history_menu", "new_chat"]
+        pv_only = ["main_menu", "check_sponsor", "history_menu", "new_chat", "mode_chat", "mode_image", "clear_all_history"]
         if data in pv_only or data.startswith("switch_sess_") or data.startswith("admin_"):
             bot.answer_callback_query(query.id, "⚠️ این منو فقط در چت خصوصی (پیوی) ربات قابل استفاده است.", show_alert=True)
             return
@@ -1246,55 +1424,117 @@ def handle_callbacks(query):
     except:
         pass
 
-    if data in ["check_sponsor", "main_menu", "mode_chat", "mode_image", "select_model_menu", "history_menu", "new_chat"]:
+    if data in ["check_sponsor", "main_menu", "mode_chat", "mode_image", "history_menu", "new_chat"]:
         clear_user_state(user_id)
 
     if data in ["check_sponsor", "main_menu"]:
         if not is_group:
             send_main_menu(chat_id, user_id)
 
+    elif data == "close_menu":
+        try:
+            bot.delete_message(chat_id, query.message.message_id)
+        except Exception:
+            pass
+
     elif data == "mode_chat":
-        safe_kv_put(f"USER_MODE_{target_key_id}", "CHAT")
-        bot.send_message(chat_id, "💬 حالت گفتگو متنی، تصویری، فایل و ساخت کد فعال شد.")
+        safe_kv_delete(f"USER_MODE_{target_key_id}")
+        bot.send_message(chat_id, "💬 حالت هوشمند ترکیبی فعال شد (پاسخ متنی، کد و تشخیص خودکار ساخت عکس).")
 
     elif data == "mode_image":
         safe_kv_put(f"USER_MODE_{target_key_id}", "IMAGE_GEN")
         if not is_group:
-            send_image_model_selection_menu(chat_id, user_id)
+            send_image_model_selection_menu(chat_id, user_id, is_group=False)
 
-    elif data == "select_model_menu":
-        send_model_selection_menu(chat_id, target_key_id)
+    elif data == "models_hub":
+        send_models_hub(chat_id, target_key_id, is_group, query.message.message_id)
+
+    elif data == "models_cat_chat":
+        new_markup = build_model_selection_markup(target_key_id, is_group)
+        try:
+            bot.edit_message_text("✨ **مدل هوش مصنوعی چت و کدنویسی را انتخاب کنید:**", chat_id=chat_id, message_id=query.message.message_id, parse_mode="Markdown", reply_markup=new_markup)
+        except Exception:
+            pass
+
+    elif data == "models_cat_image":
+        new_markup = build_image_model_selection_markup(target_key_id, is_group)
+        try:
+            bot.edit_message_text("🎨 **مدل ساخت عکس را انتخاب کنید:**", chat_id=chat_id, message_id=query.message.message_id, parse_mode="Markdown", reply_markup=new_markup)
+        except Exception:
+            pass
 
     elif data.startswith("set_model_"):
         idx = data.replace("set_model_", "")
         safe_kv_put(f"USER_MODEL_{target_key_id}", idx)
+        
         active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
         if active_sess:
-            sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
-            for s in sessions:
-                if s.get("id") == active_sess:
-                    s["modelIndex"] = idx
-                    safe_kv_put(f"SESSIONS_{user_id}", sessions)
-                    break
+            safe_kv_delete(f"HISTORY_{user_id}_{active_sess}")
+
         models = json.loads(safe_kv_get("AI_MODELS") or "[]")
         name = models[int(idx)].get("name") if idx.isdigit() and int(idx) < len(models) else "انتخاب شده"
-        bot.send_message(chat_id, f"✅ مدل فعال چت روی **{name}** تنظیم شد.", parse_mode="Markdown")
+
+        try:
+            new_markup = build_model_selection_markup(target_key_id, is_group)
+            bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=new_markup)
+        except Exception:
+            pass
+
+        bot.send_message(chat_id, f"✅ مدل چت بلافاصله روی **{name}** تنظیم شد.", parse_mode="Markdown")
 
     elif data.startswith("set_img_model_"):
         idx = data.replace("set_img_model_", "")
         safe_kv_put(f"USER_IMG_MODEL_{target_key_id}", idx)
+
         img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
         name = img_models[int(idx)].get("name") if idx.isdigit() and int(idx) < len(img_models) else "انتخاب شده"
+
+        try:
+            new_img_markup = build_image_model_selection_markup(target_key_id, is_group)
+            bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=new_img_markup)
+        except Exception:
+            pass
+
         bot.send_message(chat_id, f"🎨 مدل ساخت عکس روی **{name}** تنظیم شد.", parse_mode="Markdown")
 
     elif data == "history_menu" and not is_group:
         send_history_menu(chat_id, user_id)
 
+    elif data == "clear_all_history" and not is_group:
+        sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
+        for s in sessions:
+            sid = s.get("id")
+            if sid:
+                safe_kv_delete(f"HISTORY_{user_id}_{sid}")
+        safe_kv_delete(f"SESSIONS_{user_id}")
+        safe_kv_delete(f"ACTIVE_SESSION_{user_id}")
+        
+        new_sess = f"sess_{int(time.time())}"
+        safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_sess)
+        new_sessions = [{"id": new_sess, "title": "گفتگوی جدید 💬", "date": get_jalali_date()}]
+        safe_kv_put(f"SESSIONS_{user_id}", new_sessions)
+
+        try:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("➕ ایجاد چت جدید", callback_data="new_chat", style="success"),
+                types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")
+            )
+            bot.edit_message_text(
+                "🗑 **تمام تاریخچه و سوابق گفتگوهای قبلی شما با موفقیت پاک شدند!**\n\nاکنون می‌توانید گفتگوی جدیدی را آغاز کنید.",
+                chat_id=chat_id,
+                message_id=query.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+        except Exception:
+            bot.send_message(chat_id, "🗑 تمام تاریخچه گفتگوهای شما با موفقیت پاک شدند.")
+
     elif data == "new_chat" and not is_group:
         new_sess = f"sess_{int(time.time())}"
         safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_sess)
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
-        sessions.insert(0, {"id": new_sess, "title": "گفتگوی جدید 💬", "date": time.strftime("%Y/%m/%d")})
+        sessions.insert(0, {"id": new_sess, "title": "گفتگوی جدید 💬", "date": get_jalali_date()})
         safe_kv_put(f"SESSIONS_{user_id}", sessions)
         bot.send_message(chat_id, "✨ چت جدید ایجاد شد! پیام خود را بفرستید.")
 
@@ -1303,7 +1543,6 @@ def handle_callbacks(query):
         safe_kv_put(f"ACTIVE_SESSION_{user_id}", sess_id)
         bot.send_message(chat_id, "🔄 با موفقیت به این گفتگو منتقل شدید.")
 
-    # پنل ادمین
     elif data == "admin_panel" and user_id == ADMIN_ID:
         clear_user_state(user_id)
         bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", parse_mode="Markdown", reply_markup=get_admin_panel_markup())
@@ -1423,7 +1662,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
     elif step == "ADD_IMG_NAME":
         safe_kv_put(f"TEMP_IMG_{user_id}", {"name": text})
         safe_kv_put(f"ADMIN_STEP_{user_id}", "ADD_IMG_URL")
-        bot.send_message(chat_id, "🌐 **URL BASE** تصویرساز را وارد کنید (مثلاً `https://api.siliconflow.cn/v1` یا آدرس کامل Stability):", parse_mode="Markdown")
+        bot.send_message(chat_id, "🌐 **URL BASE** تصویرساز را وارد کنید (مثلاً `https://api.siliconflow.cn/v1`):", parse_mode="Markdown")
 
     elif step == "ADD_IMG_URL":
         temp = json.loads(safe_kv_get(f"TEMP_IMG_{user_id}") or "{}")
@@ -1437,7 +1676,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
         temp["apiKey"] = "" if text == "." else text
         safe_kv_put(f"TEMP_IMG_{user_id}", temp)
         safe_kv_put(f"ADMIN_STEP_{user_id}", "ADD_IMG_ID")
-        bot.send_message(chat_id, "📌 **MODEL NAME** تصویرساز را وارد کنید (مثلاً `stable-image-ultra` یا `black-forest-labs/FLUX.1-schnell`):", parse_mode="Markdown")
+        bot.send_message(chat_id, "📌 **MODEL NAME** تصویرساز را وارد کنید (مثلاً `black-forest-labs/FLUX.1-schnell`):", parse_mode="Markdown")
 
     elif step == "ADD_IMG_ID":
         temp = json.loads(safe_kv_get(f"TEMP_IMG_{user_id}") or "{}")
@@ -1559,7 +1798,7 @@ def handle_admin_steps(chat_id, user_id, text, step):
 # ==========================================
 if __name__ == "__main__":
     print("=" * 45)
-    print("🤖 Neo-AI-Bot with Native Colored Buttons & Stability Support Started")
+    print("🤖 Neo-AI-Bot Started Successfully")
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | SSE Streaming Active")
     print("=" * 45)
