@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Telegram AI Bot - Python + Upstash Redis (100% Safe, Instant /start & Low-CPU)
+Telegram AI Bot - Python + Upstash Redis (100% Safe, Bilingual & Instant)
 Configured for: Wispbyte / bot-hosting.net (Docker / Linux Environment)
 Architecture:
 1. 💬 Q&A & Chat Mode (Pure conversational assistant)
@@ -8,18 +8,15 @@ Architecture:
 3. 🎨 Image Generation Studio (Strict image prompts only)
 Features:
 - Instantaneous /start response (< 0.2s) with zero blocking database latency
+- 100% Airtight Sponsor Join Verification (No bypass on verify click)
+- Clean RTL Channel Link Generator (Auto sanitizes t.me, @ and full URLs)
+- Native Bilingual UI: Full Persian (🇮🇷) & English (🇬🇧) Support
 - Three 100% Independent & Isolated Operational Modes
 - Auto-Routing Safety Guard: Coding requests NEVER trigger image generators
 - Full Backup Suite: One-click JSON Chat Export + Direct JSON Restore Engine
 - Smart Cache Cleaner: Purges temporary states/files without touching user data
 - Ultra-Low CPU Engine: In-memory cancel tracking, smart activity throttling & precompiled regex
-- Instant Casual Greeting Engine (Natural friendly responses)
 - Strict Thought Filter: Strips <think> and internal monologues completely
-- Smart Group Photo Reply (Strict Vision analysis when replying to photos)
-- Real-Time Stopwatch (Accurate wall-clock time)
-- Unified /models Hub: Independent Chat & Image Model Switcher with Live Status
-- Colored Buttons (Primary Blue, Success Green, Danger Red)
-- Group Moderation Suite (Mute, Timed-Mute, Unmute, Ban, Delete) for Admins
 Timeout: 35 Minutes (2100s)
 Developer Channel: T.me/Neotenet
 """
@@ -47,18 +44,98 @@ _KNOWN_USERS_CACHE = set()
 _LAST_ACTIVE_CACHE = {}
 _CANCEL_REQS = set()
 
-# کش‌های سرعت بالا برای پاسخ آنی به /start
+# کش‌های سرعت بالا برای پاسخ آنی
 _BOT_STATUS_CACHE = None
 _BOT_STATUS_TIME = 0
 _SPONSORS_CACHE = None
 _SPONSORS_CACHE_TIME = 0
 _USER_MODES_CACHE = {}
+_USER_LANG_CACHE = {}
 
 # پیش‌کامپایل عبارات باقاعده
 _THINK_TAG_REGEX = re.compile(r'<think>[\s\S]*?</think>', flags=re.IGNORECASE)
 _CODE_BLOCK_REGEX = re.compile(r'```([a-zA-Z0-9_+-]*)[^\n]*\r?\n([\s\S]*?)```')
 _ROBOT_PREFIX_REGEX = re.compile(r'^(ربات|روبات|بات)[\s:,،\n]+(.*)$', flags=re.IGNORECASE | re.DOTALL)
 _CLEAN_WORDS_REGEX = re.compile(r'[^\w\s]')
+
+# ==========================================
+# 🌐 سیستم دو زبانه (فارسی و انگلیسی)
+# ==========================================
+I18N = {
+    "fa": {
+        "welcome": "🚀 **به ربات هوش مصنوعی خوش آمدید!**\n\n🎯 **بخش فعال:** `{mode}`\n\nیکی از گزینه‌های زیر را برای فعالیت انتخاب کنید:",
+        "mode_chat_name": "💬 پرسش و پاسخ و گفتگو",
+        "mode_code_name": "💻 کدنویسی و توسعه نرم‌افزار",
+        "mode_image_name": "🎨 استودیوی ساخت عکس",
+        "btn_chat": "💬 پرسش و پاسخ",
+        "btn_code": "💻 بخش کدنویسی",
+        "btn_img": "🎨 ساخت عکس",
+        "btn_models": "🤖 انتخاب مدل هوش مصنوعی",
+        "btn_history": "📜 تاریخچه گفتگوها",
+        "btn_support": "📞 پیام به پشتیبانی و ادمین",
+        "btn_new_chat": "➕ شروع گفتگوی جدید",
+        "btn_admin": "⚙️ پنل مدیریت ادمین",
+        "btn_lang": "🌐 تغییر زبان / Language",
+        "sponsor_warn": "⚠️ **برای استفاده از امکانات ربات، ابتدا باید در کانال‌(های) اسپانسر زیر عضو شوید:**",
+        "sponsor_btn": "📢 عضویت در کانال ({ch})",
+        "sponsor_check_btn": "✅ عضو شدم / بررسی",
+        "sponsor_not_joined": "⚠️ شما هنوز در تمام کانال‌های اسپانسر عضو نشده‌اید!\nلطفاً ابتدا عضو شوید و سپس دکمه بررسی را بزنید.",
+        "sponsor_verified": "✅ عضویت شما با موفقیت تایید شد!",
+        "lang_select_title": "🌐 **لطفاً زبان مورد نظر خود را انتخاب کنید / Please select your language:**",
+        "lang_changed": "✅ زبان ربات با موفقیت روی **فارسی** تنظیم شد.",
+        "chat_mode_msg": "💬 **بخش «پرسش و پاسخ و گفتگو» فعال شد.**\nاکنون هر سوال علمی، عمومی، ترجمه یا متنی دارید بنویسید.",
+        "code_mode_msg": "💻 **بخش «کدنویسی و توسعه نرم‌افزار» فعال شد.**\nزبان یا اسکریپت مورد نظرتان را اعلام کنید تا کد کامل همراه با فایل برایتان آماده شود.",
+        "image_mode_msg": "🎨 **بخش «استودیو ساخت عکس» فعال شد.**\nتوصیف تصویری که می‌خواهید ساخته شود را بفرستید.",
+        "cancel_btn": "❌ لغو عملیات",
+        "req_canceled": "❌ عملیات با موفقیت لغو شد.",
+        "new_chat_msg": "✨ چت جدید ایجاد شد! پیام خود را بفرستید."
+    },
+    "en": {
+        "welcome": "🚀 **Welcome to the AI Bot!**\n\n🎯 **Active Mode:** `{mode}`\n\nChoose an option below to begin:",
+        "mode_chat_name": "💬 Q&A and Chat",
+        "mode_code_name": "💻 Coding & Software Dev",
+        "mode_image_name": "🎨 Image Generation Studio",
+        "btn_chat": "💬 Q&A & Chat",
+        "btn_code": "💻 Coding & Dev",
+        "btn_img": "🎨 Image Studio",
+        "btn_models": "🤖 Select AI Model",
+        "btn_history": "📜 Chat History",
+        "btn_support": "📞 Contact Support",
+        "btn_new_chat": "➕ New Chat",
+        "btn_admin": "⚙️ Admin Panel",
+        "btn_lang": "🌐 Language / زبان",
+        "sponsor_warn": "⚠️ **Please join our sponsor channel(s) below to use the bot:**",
+        "sponsor_btn": "📢 Join Channel ({ch})",
+        "sponsor_check_btn": "✅ Joined / Verify",
+        "sponsor_not_joined": "⚠️ You have not joined all sponsor channels yet!\nPlease join and click verify again.",
+        "sponsor_verified": "✅ Membership verified successfully!",
+        "lang_select_title": "🌐 **Please select your language / لطفاً زبان مورد نظر را انتخاب کنید:**",
+        "lang_changed": "✅ Language successfully set to **English**.",
+        "chat_mode_msg": "💬 **Q&A & Chat mode activated.**\nYou can now ask questions, translate text, or converse.",
+        "code_mode_msg": "💻 **Coding & Software Dev mode activated.**\nDescribe what you need, and code files will be prepared.",
+        "image_mode_msg": "🎨 **Image Generation Studio activated.**\nSend the description of the image you want to generate.",
+        "cancel_btn": "❌ Cancel",
+        "req_canceled": "❌ Operation canceled successfully.",
+        "new_chat_msg": "✨ New chat started! Send your message."
+    }
+}
+
+def get_user_lang(user_id):
+    u_str = str(user_id)
+    if u_str in _USER_LANG_CACHE:
+        return _USER_LANG_CACHE[u_str]
+    lang = safe_kv_get(f"USER_LANG_{u_str}") or "fa"
+    if lang not in ["fa", "en"]:
+        lang = "fa"
+    _USER_LANG_CACHE[u_str] = lang
+    return lang
+
+def tr(user_id, key, **kwargs):
+    lang = get_user_lang(user_id)
+    text = I18N.get(lang, I18N["fa"]).get(key, I18N["fa"].get(key, ""))
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
 
 # ==========================================
 # 🎨 تزریق دکمه‌های رنگی تلگرام (Monkey-Patch)
@@ -129,11 +206,11 @@ def format_session_date(d_str):
 # ==========================================
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT TOKEN")
-ADMIN_ID = str(os.getenv("ADMIN_ID", "ID ADMIN"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "Token")
+ADMIN_ID = str(os.getenv("ADMIN_ID", "Admin Id"))
 
-UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious.upstash.io")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "DATE BASE TOKEN")
+UPSTASH_URL = os.getenv("UPSTASH_URL", "Base url")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "Token datebase")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
@@ -218,6 +295,15 @@ def is_bot_globally_active():
     _BOT_STATUS_TIME = now
     return res
 
+def clean_channel_username(raw_ch):
+    """پاکسازی هر نوع فرمت لینک و تبدیل آن به یوزرنیم خالص بدون خطای راست‌چین"""
+    if not raw_ch:
+        return ""
+    clean = str(raw_ch).strip()
+    clean = re.sub(r'^(https?://)?(www\.)?(t\.me/|telegram\.me/)', '', clean, flags=re.IGNORECASE)
+    clean = clean.lstrip('@').strip().rstrip('/')
+    return clean
+
 def get_sponsor_channels_cached():
     global _SPONSORS_CACHE, _SPONSORS_CACHE_TIME
     now = time.time()
@@ -227,9 +313,12 @@ def get_sponsor_channels_cached():
     channels = []
     if channels_raw:
         try:
-            channels = json.loads(channels_raw)
+            parsed = json.loads(channels_raw)
+            channels = [clean_channel_username(c) for c in parsed if clean_channel_username(c)]
         except Exception:
-            channels = [channels_raw]
+            clean = clean_channel_username(channels_raw)
+            if clean:
+                channels = [clean]
     _SPONSORS_CACHE = channels
     _SPONSORS_CACHE_TIME = now
     return channels
@@ -329,7 +418,7 @@ def track_user_activity(user_id):
     threading.Thread(target=_worker, daemon=True).start()
 
 def clear_user_state(user_id):
-    """پاکسازی فوری تمام متغیرها در یک دستور تکی ردیس (به جای ۸ درخواست جداگانه)"""
+    """پاکسازی فوری تمام متغیرها در یک دستور تکی ردیس"""
     keys = [
         f"ADMIN_STEP_{user_id}", f"TEMP_MODEL_{user_id}",
         f"TEMP_IMG_{user_id}", f"ADMIN_EDIT_IDX_{user_id}",
@@ -349,6 +438,7 @@ def is_group_admin(chat_id, user_id):
         return False
 
 def check_sponsor_join(user_id):
+    """بررسی زنده و تضمینی عضویت در کانال‌های اسپانسر بدون امکان دور زدن"""
     if str(user_id) == str(ADMIN_ID):
         return True, []
         
@@ -358,13 +448,16 @@ def check_sponsor_join(user_id):
 
     unjoined = []
     for ch in channels:
-        formatted_ch = ch if ch.startswith("@") else f"@{ch}"
+        clean_ch = clean_channel_username(ch)
+        if not clean_ch:
+            continue
+        formatted_ch = f"@{clean_ch}"
         try:
             member = bot.get_chat_member(formatted_ch, int(user_id))
             if member.status not in ["creator", "administrator", "member"]:
-                unjoined.append(formatted_ch)
+                unjoined.append(clean_ch)
         except Exception:
-            unjoined.append(formatted_ch)
+            unjoined.append(clean_ch)
 
     return len(unjoined) == 0, unjoined
 
@@ -482,7 +575,7 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         return False
 
 # ==========================================
-# ۱. رابط کاربری ۳ حالته و تفکیک‌شده (/models)
+# ۱. رابط کاربری ۳ حالته و تفکیک‌شده دو زبانه
 # ==========================================
 def get_user_current_mode(target_key_id):
     if target_key_id in _USER_MODES_CACHE:
@@ -496,9 +589,9 @@ def get_user_current_mode(target_key_id):
 def get_main_menu_markup(user_id, current_mode="CHAT"):
     markup = types.InlineKeyboardMarkup(row_width=2)
     
-    chat_lbl = "✅ 💬 پرسش و پاسخ" if current_mode == "CHAT" else "💬 پرسش و پاسخ"
-    code_lbl = "✅ 💻 بخش کدنویسی" if current_mode == "CODE" else "💻 بخش کدنویسی"
-    img_lbl  = "✅ 🎨 ساخت عکس" if current_mode == "IMAGE" else "🎨 ساخت عکس"
+    chat_lbl = f"✅ {tr(user_id, 'btn_chat')}" if current_mode == "CHAT" else tr(user_id, 'btn_chat')
+    code_lbl = f"✅ {tr(user_id, 'btn_code')}" if current_mode == "CODE" else tr(user_id, 'btn_code')
+    img_lbl  = f"✅ {tr(user_id, 'btn_img')}" if current_mode == "IMAGE" else tr(user_id, 'btn_img')
     
     markup.add(
         types.InlineKeyboardButton(chat_lbl, callback_data="switch_mode_chat", style="primary"),
@@ -508,34 +601,59 @@ def get_main_menu_markup(user_id, current_mode="CHAT"):
         types.InlineKeyboardButton(img_lbl, callback_data="switch_mode_image", style="success")
     )
     markup.add(
-        types.InlineKeyboardButton("🤖 انتخاب مدل هوش مصنوعی", callback_data="models_hub"),
-        types.InlineKeyboardButton("📜 تاریخچه گفتگوها", callback_data="history_menu")
+        types.InlineKeyboardButton(tr(user_id, 'btn_models'), callback_data="models_hub"),
+        types.InlineKeyboardButton(tr(user_id, 'btn_history'), callback_data="history_menu")
     )
     markup.add(
-        types.InlineKeyboardButton("📞 پیام به پشتیبانی و ادمین", callback_data="contact_admin", style="primary")
+        types.InlineKeyboardButton(tr(user_id, 'btn_support'), callback_data="contact_admin", style="primary"),
+        types.InlineKeyboardButton(tr(user_id, 'btn_lang'), callback_data="open_lang_menu")
     )
-    row_last = [types.InlineKeyboardButton("➕ شروع گفتگوی جدید", callback_data="new_chat", style="success")]
+    row_last = [types.InlineKeyboardButton(tr(user_id, 'btn_new_chat'), callback_data="new_chat", style="success")]
     if str(user_id) == str(ADMIN_ID):
-        row_last.append(types.InlineKeyboardButton("⚙️ پنل مدیریت ادمین", callback_data="admin_panel", style="primary"))
+        row_last.append(types.InlineKeyboardButton(tr(user_id, 'btn_admin'), callback_data="admin_panel", style="primary"))
     markup.add(*row_last)
     return markup
 
 def send_main_menu(chat_id, user_id):
     current_mode = get_user_current_mode(user_id)
-    mode_names = {"CHAT": "💬 پرسش و پاسخ و گفتگو", "CODE": "💻 کدنویسی و توسعه نرم‌افزار", "IMAGE": "🎨 استودیوی ساخت عکس"}
-    text = (
-        "🚀 **به ربات هوش مصنوعی خوش آمدید!**\n\n"
-        f"🎯 **بخش فعال فعلی:** `{mode_names.get(current_mode, 'پرسش و پاسخ')}`\n\n"
-        "یکی از سه بخش زیر را برای فعالیت انتخاب کنید:"
+    mode_key_map = {"CHAT": "mode_chat_name", "CODE": "mode_code_name", "IMAGE": "mode_image_name"}
+    mode_text = tr(user_id, mode_key_map.get(current_mode, "mode_chat_name"))
+    welcome_text = tr(user_id, "welcome", mode=mode_text)
+    bot.send_message(chat_id, welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_markup(user_id, current_mode))
+
+def send_lang_selection_menu(chat_id, user_id, message_id=None):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🇮🇷 فارسی", callback_data="set_lang_fa", style="primary"),
+        types.InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en", style="primary")
     )
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=get_main_menu_markup(user_id, current_mode))
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت / Back", callback_data="main_menu"))
+    text = tr(user_id, "lang_select_title")
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown", reply_markup=markup)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+
+def build_sponsor_markup(user_id, unjoined_channels):
+    """ساخت کیبورد شیشه‌ای کانال‌های اسپانسر با لینک مستقیم و چیدمان بدون ایراد RTL"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for ch in unjoined_channels:
+        clean_ch = clean_channel_username(ch)
+        btn_label = tr(user_id, "sponsor_btn", ch=clean_ch)
+        btn_url = f"https://t.me/{clean_ch}"
+        markup.add(types.InlineKeyboardButton(btn_label, url=btn_url))
+    markup.add(types.InlineKeyboardButton(tr(user_id, "sponsor_check_btn"), callback_data="check_sponsor", style="success"))
+    return markup
 
 def send_history_menu(chat_id, user_id, message_id=None):
     sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
     active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
 
     if not sessions:
-        empty_text = "📜 هیچ تاریخچه گفتگویی در حافظه یافت نشد."
+        empty_text = "📜 هیچ تاریخچه گفتگویی در حافظه یافت نشد." if get_user_lang(user_id) == "fa" else "📜 No chat history found."
         if message_id:
             try:
                 bot.edit_message_text(empty_text, chat_id=chat_id, message_id=message_id)
@@ -558,11 +676,11 @@ def send_history_menu(chat_id, user_id, message_id=None):
         )
 
     markup.add(
-        types.InlineKeyboardButton("➕ ایجاد چت جدید", callback_data="new_chat", style="success"),
-        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")
+        types.InlineKeyboardButton("➕ ایجاد چت جدید" if get_user_lang(user_id) == "fa" else "➕ New Chat", callback_data="new_chat", style="success"),
+        types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی" if get_user_lang(user_id) == "fa" else "🔙 Main Menu", callback_data="main_menu")
     )
 
-    text = "📜 **لیست گفتگوهای ذخیره‌شده شما:**\nبرای انتخاب روی متن چت و برای حذف تکی روی دکمه سطل زباله (🗑) کلیک کنید:"
+    text = "📜 **لیست گفتگوهای ذخیره‌شده شما:**\nبرای انتخاب روی متن چت و برای حذف تکی روی دکمه سطل زباله (🗑) کلیک کنید:" if get_user_lang(user_id) == "fa" else "📜 **Your Saved Conversations:**"
     if message_id:
         try:
             bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown", reply_markup=markup)
@@ -876,10 +994,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     buttons = []
 
     for idx, ch in enumerate(channels):
-        buttons.append(types.InlineKeyboardButton(f"🗑 {ch}", callback_data=f"del_sponsor_{idx}", style="danger"))
-
-    for i in range(0, len(buttons), 2):
-        markup.row(*buttons[i:i+2])
+        markup.add(types.InlineKeyboardButton(f"🗑 {ch}", callback_data=f"del_sponsor_{idx}", style="danger"))
 
     markup.add(types.InlineKeyboardButton("🔙 پنل ادمین", callback_data="admin_panel"))
     if message_id:
@@ -896,6 +1011,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
 def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id, thread_id=None, active_mode="CHAT"):
     models = json.loads(safe_kv_get("AI_MODELS") or "[]")
     active_session_id = get_or_create_active_session(user_id)
+    lang = get_user_lang(user_id)
 
     user_selected = safe_kv_get(f"USER_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{user_id}") or "0"
     try:
@@ -904,22 +1020,22 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         model_idx = 0
 
     if not models or model_idx >= len(models):
-        bot.send_message(chat_id, "⚠️ ابتدا یک مدل چت در ربات ثبت کنید.", message_thread_id=thread_id)
+        bot.send_message(chat_id, "⚠️ ابتدا یک مدل چت در ربات ثبت کنید." if lang == "fa" else "⚠️ Please add a chat model first.", message_thread_id=thread_id)
         return
 
     active_model = models[model_idx]
     if not text_prompt:
-        text_prompt = "سلام"
+        text_prompt = "سلام" if lang == "fa" else "Hello"
         
     is_greeting = is_casual_greeting(text_prompt)
 
     req_id = f"{user_id}_{int(time.time()*1000)}"
     cancel_markup = types.InlineKeyboardMarkup()
-    cancel_markup.add(types.InlineKeyboardButton("❌ لغو و توقف فکر کردن", callback_data=f"cancel_req_{req_id}", style="danger"))
+    cancel_markup.add(types.InlineKeyboardButton(tr(user_id, "cancel_btn"), callback_data=f"cancel_req_{req_id}", style="danger"))
 
     reply_to = target_reply_id if target_reply_id else (message.message_id if is_group else None)
     mode_icon = "💻" if active_mode == "CODE" else "💬"
-    initial_text = f"{mode_icon} در حال پردازش با {active_model.get('name')}... ⏱️ 00:00"
+    initial_text = f"{mode_icon} در حال پردازش با {active_model.get('name')}... ⏱️ 00:00" if lang == "fa" else f"{mode_icon} Processing with {active_model.get('name')}... ⏱️ 00:00"
 
     try:
         status_msg = bot.send_message(
@@ -954,7 +1070,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 secs = elapsed % 60
                 time_display = f"{mins:02d}:{secs:02d}"
 
-                cur_txt = f"{mode_icon} در حال پردازش با {active_model.get('name')}... ⏱️ {time_display}"
+                cur_txt = f"{mode_icon} در حال پردازش با {active_model.get('name')}... ⏱️ {time_display}" if lang == "fa" else f"{mode_icon} Processing with {active_model.get('name')}... ⏱️ {time_display}"
                 try:
                     bot.edit_message_text(cur_txt, chat_id=chat_id, message_id=status_msg_id, reply_markup=cancel_markup)
                     last_edit_time = now
@@ -974,7 +1090,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         if message.photo:
             if not active_model.get("supportsVision"):
                 is_done = True
-                bot.edit_message_text("❌ این مدل از تحلیل عکس پشتیبانی نمی‌کند.", chat_id=chat_id, message_id=status_msg_id)
+                bot.edit_message_text("❌ این مدل از تحلیل عکس پشتیبانی نمی‌کند." if lang == "fa" else "❌ This model does not support Vision.", chat_id=chat_id, message_id=status_msg_id)
                 return
 
             file_id = message.photo[-1].file_id
@@ -994,8 +1110,8 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             cleaned_messages = []
             for idx, item in enumerate(history):
                 if idx < len(history) - 1 and isinstance(item.get("content"), list):
-                    txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "تصویر قبلی")
-                    cleaned_messages.append({"role": item["role"], "content": f"[تصویر ارسال شده: {txt_part}]"})
+                    txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "image")
+                    cleaned_messages.append({"role": item["role"], "content": f"[Image: {txt_part}]"})
                 else:
                     cleaned_messages.append(item)
 
@@ -1010,20 +1126,21 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         base_url = active_model.get("baseUrl", "").strip().rstrip("/")
         endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
 
+        target_lang_str = "Persian (Farsi)" if lang == "fa" else "English"
         if active_mode == "CODE":
             system_prompt_content = (
-                f"You are {active_model.get('name')}, an expert senior software engineer and programmer. "
-                "CRITICAL INSTRUCTIONS:\n"
-                "1. Focus strictly on programming, architecture, debugging, and clean code generation.\n"
-                "2. Provide a clear Persian explanation, then complete, working, professional code in proper markdown codeblocks.\n"
-                "3. NEVER output English internal monologue or <think> tags."
+                f"You are {active_model.get('name')}, an expert senior software engineer. "
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"1. Focus strictly on programming, architecture, debugging, and clean code generation.\n"
+                f"2. Provide explanations in natural {target_lang_str}, followed by complete, working code in proper markdown codeblocks.\n"
+                f"3. NEVER output internal monologue, notes, or <think> tags."
             )
         else:
             system_prompt_content = (
-                f"You are {active_model.get('name')}, an intelligent and friendly Persian conversational assistant. "
-                "CRITICAL INSTRUCTIONS:\n"
-                "1. Answer questions, chat, explain, teach, and converse in natural Persian.\n"
-                "2. NEVER output English internal monologue, notes, or <think> tags."
+                f"You are {active_model.get('name')}, an intelligent and friendly AI assistant. "
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"1. Answer questions, chat, explain, and converse clearly in natural {target_lang_str}.\n"
+                f"2. NEVER output internal monologue, notes, or <think> tags."
             )
 
         system_prompt = {"role": "system", "content": system_prompt_content}
@@ -1095,7 +1212,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 clean_c = _THINK_TAG_REGEX.sub('', c).strip()
                 api_response_text = clean_c if clean_c else (c if c.strip() else r)
         else:
-            api_response_text = f"❌ خطای سرور API (کد {res.status_code}):\n{res.text[:250]}"
+            api_response_text = f"❌ API Error ({res.status_code}):\n{res.text[:250]}"
 
         if api_response_text:
             api_response_text = _THINK_TAG_REGEX.sub('', api_response_text).strip()
@@ -1107,7 +1224,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             hist_to_save = []
             for item in history[-6:]:
                 if isinstance(item.get("content"), list):
-                    txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "تصویر")
+                    txt_part = next((p.get("text") for p in item["content"] if p.get("type") == "text"), "image")
                     hist_to_save.append({"role": item["role"], "content": txt_part})
                 else:
                     hist_to_save.append(item)
@@ -1116,11 +1233,11 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             update_session_title_if_new(user_id, active_session_id, text_prompt)
 
     except requests.exceptions.Timeout:
-        api_response_text = "❌ زمان ارسال درخواست به بیش از ۳۵ دقیقه رسید و ارتباط قطع شد."
+        api_response_text = "❌ زمان پاسخ بیش از ۳۵ دقیقه شد و قطع گردید." if lang == "fa" else "❌ Request timed out."
     except requests.exceptions.ConnectionError:
-        api_response_text = "❌ خطای قطع ارتباط با سرور هوش مصنوعی."
+        api_response_text = "❌ خطای قطع ارتباط با سرور هوش مصنوعی." if lang == "fa" else "❌ Connection error with AI server."
     except Exception as e:
-        api_response_text = f"❌ خطای ارتباطی: {type(e).__name__} - {str(e)[:100]}"
+        api_response_text = f"❌ Error: {type(e).__name__} - {str(e)[:100]}"
     finally:
         is_done = True
         _CANCEL_REQS.discard(req_id)
@@ -1128,8 +1245,8 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
     if api_response_text and not api_response_text.startswith("❌"):
         if is_group:
-            sender_name = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "کاربر")
-            final_text = f"👤 **کاربر:** {sender_name} | {mode_icon} **مدل:** {active_model.get('name')}\n\n{clean_text}"
+            sender_name = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "User")
+            final_text = f"👤 **User:** {sender_name} | {mode_icon} **Model:** {active_model.get('name')}\n\n{clean_text}"
         else:
             final_text = clean_text
 
@@ -1148,7 +1265,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
     else:
         if req_id not in _CANCEL_REQS and safe_kv_get(f"CANCEL_{req_id}") != "true":
             try:
-                bot.edit_message_text(api_response_text or "❌ سرور پاسخی ارسال نکرد.", chat_id=chat_id, message_id=status_msg_id)
+                bot.edit_message_text(api_response_text or "❌ Empty response.", chat_id=chat_id, message_id=status_msg_id)
             except Exception:
                 pass
 
@@ -1158,24 +1275,26 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None):
     img_models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
     img_idx_str = safe_kv_get(f"USER_IMG_MODEL_{target_key_id}") or safe_kv_get(f"USER_IMG_MODEL_{user_id}") or "0"
+    lang = get_user_lang(user_id)
     try:
         img_idx = int(img_idx_str)
     except:
         img_idx = 0
 
     if not img_models or img_idx >= len(img_models):
-        bot.send_message(chat_id, "⚠️ هیچ مدل تصویرسازی تعریف نشده است.", message_thread_id=thread_id)
+        bot.send_message(chat_id, "⚠️ هیچ مدل تصویرسازی تعریف نشده است." if lang == "fa" else "⚠️ No image models defined.", message_thread_id=thread_id)
         return
 
     active_img_model = img_models[img_idx]
 
     req_id = f"{user_id}_img_{int(time.time()*1000)}"
     cancel_markup = types.InlineKeyboardMarkup()
-    cancel_markup.add(types.InlineKeyboardButton("❌ لغو ساخت تصویر", callback_data=f"cancel_req_{req_id}", style="danger"))
+    cancel_markup.add(types.InlineKeyboardButton(tr(user_id, "cancel_btn"), callback_data=f"cancel_req_{req_id}", style="danger"))
 
+    loading_msg = f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00" if lang == "fa" else f"🎨 Generating image with {active_img_model.get('name')}... ⏱️ 00:00"
     status_msg = bot.send_message(
         chat_id,
-        f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00",
+        loading_msg,
         reply_markup=cancel_markup,
         message_thread_id=thread_id
     )
@@ -1201,9 +1320,10 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 mins = elapsed // 60
                 secs = elapsed % 60
                 time_display = f"{mins:02d}:{secs:02d}"
+                cur_text = f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}" if lang == "fa" else f"🎨 Generating image with {active_img_model.get('name')}... ⏱️ {time_display}"
                 try:
                     bot.edit_message_text(
-                        f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}",
+                        cur_text,
                         chat_id=chat_id,
                         message_id=status_msg_id,
                         reply_markup=cancel_markup
@@ -1237,7 +1357,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             if res.status_code == 200:
                 image_data = res.content
             else:
-                error_msg = f"کد خطا: {res.status_code}\n{res.text[:200]}"
+                error_msg = f"Code: {res.status_code}\n{res.text[:200]}"
 
         elif "pollinations.ai" in base_url:
             encoded_prompt = urllib.parse.quote(prompt_text)
@@ -1261,7 +1381,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 if "data" in data and len(data["data"]) > 0:
                     image_data = data["data"][0].get("url")
             else:
-                error_msg = f"کد خطا: {res.status_code}\n{res.text[:200]}"
+                error_msg = f"Code: {res.status_code}\n{res.text[:200]}"
 
     except Exception as e:
         error_msg = str(e)
@@ -1272,7 +1392,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         _CANCEL_REQS.discard(req_id)
         safe_kv_delete(f"CANCEL_{req_id}")
         try:
-            bot.edit_message_text("❌ عملیات ساخت تصویر لغو گردید.", chat_id=chat_id, message_id=status_msg_id)
+            bot.edit_message_text("❌ ساخت تصویر لغو شد." if lang == "fa" else "❌ Image generation canceled.", chat_id=chat_id, message_id=status_msg_id)
         except Exception:
             pass
         return
@@ -1285,14 +1405,14 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             bot.delete_message(chat_id, status_msg_id)
         except Exception:
             pass
-        caption = f"✨ **تصویر تولید شده با {active_img_model.get('name')}**\n\n📝 **پرامپت:** {prompt_text}"
+        caption = f"✨ **Image generated with {active_img_model.get('name')}**\n\n📝 **Prompt:** {prompt_text}" if lang == "en" else f"✨ **تصویر تولید شده با {active_img_model.get('name')}**\n\n📝 **پرامپت:** {prompt_text}"
         try:
             bot.send_photo(chat_id, image_data, caption=caption, parse_mode="Markdown", message_thread_id=thread_id)
         except Exception:
             bot.send_photo(chat_id, image_data, caption=caption, message_thread_id=thread_id)
     else:
         try:
-            bot.edit_message_text(f"❌ ساخت تصویر با خطا مواجه شد.\n{error_msg or ''}", chat_id=chat_id, message_id=status_msg_id)
+            bot.edit_message_text(f"❌ ساخت تصویر با خطا مواجه شد.\n{error_msg or ''}" if lang == "fa" else f"❌ Image generation failed.\n{error_msg or ''}", chat_id=chat_id, message_id=status_msg_id)
         except Exception:
             pass
 
@@ -1306,7 +1426,6 @@ def handle_start_command(msg):
     is_group = msg.chat.type in ["group", "supergroup"]
     thread_id = getattr(msg, 'message_thread_id', None) if getattr(msg, 'is_topic_message', False) else None
 
-    # بررسی وضعیت فعال بودن بدون معطلی دیتابیس
     if not is_bot_globally_active() and user_id != ADMIN_ID:
         bot.send_message(
             chat_id,
@@ -1333,18 +1452,14 @@ def handle_start_command(msg):
         )
         return
 
-    # بررسی اسپانسر (از رم کش‌شده خوانده می‌شود و سریع است)
+    # بررسی تضمینی عضویت در کانال‌های اسپانسر
     ok_sponsor, unjoined = check_sponsor_join(user_id)
     if not ok_sponsor and ADMIN_ID and user_id != ADMIN_ID:
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        buttons = [types.InlineKeyboardButton(f"📢 ورود به کانال {ch}", url=f"https://t.me/{ch.replace('@', '')}") for ch in unjoined]
-        for i in range(0, len(buttons), 2):
-            markup.row(*buttons[i:i+2])
-        markup.add(types.InlineKeyboardButton("✅ عضو شدم / بررسی", callback_data="check_sponsor", style="success"))
-        bot.send_message(chat_id, "⚠️ برای استفاده از ربات ابتدا در کانال‌های زیر عضو شوید:", reply_markup=markup)
+        markup = build_sponsor_markup(user_id, unjoined)
+        bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
         return
 
-    # پاکسازی وضعیت‌های موقت در پس‌زمینه (بدون اینکه کاربر حتی یک میلی‌ثانیه معطل شود)
+    # پاکسازی وضعیت‌های موقت در پس‌زمینه
     threading.Thread(target=clear_user_state, args=(user_id,), daemon=True).start()
     
     # ارسال فوری منو
@@ -1365,11 +1480,10 @@ def handle_all_messages(msg):
     thread_id = getattr(msg, 'message_thread_id', None) if getattr(msg, 'is_topic_message', False) else None
     target_key_id = f"group_{chat_id}" if is_group else user_id
 
-    # بررسی وضعیت خاموش بودن
     if not is_bot_globally_active() and user_id != ADMIN_ID:
         bot.send_message(
             chat_id,
-            "⚠️ **ربات موقتاً توسط مدیریت خاموش و در دست به‌روزرسانی می‌باشد.**\nلطفاً ساعاتی دیگر مراجعه کنید. 🙏",
+            "⚠️ **ربات موقتاً توسط مدیریت خاموش است.**",
             parse_mode="Markdown",
             message_thread_id=thread_id
         )
@@ -1434,8 +1548,7 @@ def handle_all_messages(msg):
                 res_text = (
                     "✅ **اطلاعات با موفقیت بازگردانی شد!**\n\n"
                     f"👥 کاربران بازیابی‌شده: **{restored_users}**\n"
-                    f"💬 گفتگوهای اضافه‌شده به دیتابیس: **{restored_sessions}**\n\n"
-                    "اطلاعات بدون تداخل با اطلاعات فعلی ادغام شدند."
+                    f"💬 گفتگوهای اضافه‌شده به دیتابیس: **{restored_sessions}**"
                 )
                 bot.edit_message_text(res_text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="Markdown")
             except Exception as e:
@@ -1466,21 +1579,21 @@ def handle_all_messages(msg):
         sender_user = f"@{msg.from_user.username}" if msg.from_user.username else "بدون یوزرنیم"
 
         admin_notify = (
-            f"📩 **پیام جدید از کاربر به پشتیبانی:**\n\n"
+            f"📩 **پیام جدید به پشتیبانی:**\n\n"
             f"👤 **نام:** {sender_name}\n"
             f"🆔 **آیدی عددی:** `{user_id}`\n"
             f"🔗 **یوزرنیم:** {sender_user}\n\n"
-            f"👇 پیام یا فایل کاربر:"
+            f"👇 پیام یا فایل:"
         )
         markup_reply = types.InlineKeyboardMarkup()
-        markup_reply.add(types.InlineKeyboardButton("✍️ ارسال پاسخ به این کاربر", callback_data=f"admin_reply_{user_id}", style="primary"))
+        markup_reply.add(types.InlineKeyboardButton("✍️ ارسال پاسخ", callback_data=f"admin_reply_{user_id}", style="primary"))
         
         try:
             bot.send_message(ADMIN_ID, admin_notify, parse_mode="Markdown")
             bot.copy_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=msg.message_id, reply_markup=markup_reply)
             bot.send_message(chat_id, "✅ پیام شما با موفقیت به پشتیبانی ارسال شد.")
         except Exception as e:
-            bot.send_message(chat_id, f"❌ خطا در ارسال پیام به پشتیبانی: {e}")
+            bot.send_message(chat_id, f"❌ خطا در ارسال: {e}")
         return
 
     # پاسخ ادمین به کاربر
@@ -1506,15 +1619,12 @@ def handle_all_messages(msg):
                 handle_admin_steps(chat_id, user_id, text, admin_step)
                 return
 
+    # بررسی مجدد اسپانسر برای پیام‌های معمولی در پیوی
     if not is_group:
         ok_sponsor, unjoined = check_sponsor_join(user_id)
         if not ok_sponsor and ADMIN_ID and user_id != ADMIN_ID:
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            buttons = [types.InlineKeyboardButton(f"📢 ورود به کانال {ch}", url=f"https://t.me/{ch.replace('@', '')}") for ch in unjoined]
-            for i in range(0, len(buttons), 2):
-                markup.row(*buttons[i:i+2])
-            markup.add(types.InlineKeyboardButton("✅ عضو شدم / بررسی", callback_data="check_sponsor", style="success"))
-            bot.send_message(chat_id, "⚠️ برای استفاده از ربات ابتدا در کانال‌های زیر عضو شوید:", reply_markup=markup)
+            markup = build_sponsor_markup(user_id, unjoined)
+            bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
             return
 
     if text.startswith("/models"):
@@ -1625,31 +1735,31 @@ def handle_all_messages(msg):
     has_photo_attached = bool(msg.photo or (msg.reply_to_message and msg.reply_to_message.photo))
     active_mode = get_user_current_mode(target_key_id)
     
-    # ۱. بررسی هوشمند اولویت کدنویسی
+    # ۱. اولویت قطعی کدنویسی
     is_code = is_coding_intent(text)
     
-    # ۲. بررسی قصد ساخت عکس
+    # ۲. قصد ساخت عکس
     is_img_prompt, clean_img_prompt = detect_image_intent(text) if not has_photo_attached else (False, text)
 
-    # قانون ۱: اگر کاربر درخواست کدنویسی داد، به هیچ عنوان عکس ساخته نمی‌شود!
+    # قانون ۱: اگر کدنویسی است، عکس اجرا نشود
     if is_code:
         _USER_MODES_CACHE[target_key_id] = "CODE"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
         threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE"), daemon=True).start()
         return
 
-    # قانون ۲: ساخت عکس تنها در صورت درخواست مستقیم یا فعال بودن استودیو عکس
+    # قانون ۲: ساخت عکس تنها در صورت درخواست مستقیم یا حالت فعال عکس
     if (active_mode == "IMAGE" or is_img_prompt) and not has_photo_attached:
         img_prompt_to_use = clean_img_prompt if is_img_prompt else text
         threading.Thread(target=worker_image_process, args=(chat_id, user_id, img_prompt_to_use, target_key_id, thread_id), daemon=True).start()
         return
 
-    # قانون ۳: در سایر موارد، پاسخ متنی چت یا کد داده می‌شود
+    # قانون ۳: پاسخ متنی هوشمند چت یا کد
     current_ai_mode = "CODE" if active_mode == "CODE" else "CHAT"
     threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode), daemon=True).start()
 
 # ==========================================
-# ۶. هندلر دکمه‌های شیشه‌ای و سوییچ لحظه‌ای ۳ حالت
+# ۶. هندلر دکمه‌های شیشه‌ای و سوییچ لحظه‌ای ۳ حالت و تایید اسپانسر
 # ==========================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(query):
@@ -1675,10 +1785,36 @@ def handle_callbacks(query):
         _CANCEL_REQS.add(req_id)
         safe_kv_put(f"CANCEL_{req_id}", "true", 2100)
         try:
-            bot.edit_message_text("❌ عملیات با موفقیت لغو شد.", chat_id=chat_id, message_id=query.message.message_id)
+            bot.edit_message_text(tr(user_id, "req_canceled"), chat_id=chat_id, message_id=query.message.message_id)
         except Exception:
             pass
         return
+
+    # ==========================================
+    # 🔒 تایید عضویت اسپانسر بدون امکان دور زدن
+    # ==========================================
+    if data == "check_sponsor" and not is_group:
+        ok_sponsor, unjoined = check_sponsor_join(user_id)
+        if not ok_sponsor:
+            bot.answer_callback_query(
+                query.id,
+                tr(user_id, "sponsor_not_joined"),
+                show_alert=True
+            )
+            try:
+                markup = build_sponsor_markup(user_id, unjoined)
+                bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        else:
+            bot.answer_callback_query(query.id, tr(user_id, "sponsor_verified"))
+            try:
+                bot.delete_message(chat_id, query.message.message_id)
+            except Exception:
+                pass
+            send_main_menu(chat_id, user_id)
+            return
 
     if is_group:
         group_allowed_actions = ["models_hub", "models_cat_chat", "models_cat_image", "close_menu"]
@@ -1689,7 +1825,7 @@ def handle_callbacks(query):
                 bot.answer_callback_query(query.id, "⛔ تغییر مدل در گروه فقط توسط ادمین امکان‌پذیر است!", show_alert=True)
                 return
 
-        pv_only = ["main_menu", "check_sponsor", "history_menu", "new_chat", "switch_mode_chat", "switch_mode_code", "switch_mode_image", "contact_admin"]
+        pv_only = ["main_menu", "history_menu", "new_chat", "switch_mode_chat", "switch_mode_code", "switch_mode_image", "contact_admin", "open_lang_menu"]
         if data in pv_only or data.startswith("switch_sess_") or data.startswith("del_single_sess_") or data.startswith("admin_"):
             bot.answer_callback_query(query.id, "⚠️ این منو فقط در چت خصوصی (پیوی) ربات قابل استفاده است.", show_alert=True)
             return
@@ -1699,18 +1835,34 @@ def handle_callbacks(query):
     except Exception:
         pass
 
-    if data in ["check_sponsor", "main_menu", "history_menu", "new_chat"]:
+    if data in ["main_menu", "history_menu", "new_chat"]:
         clear_user_state(user_id)
 
+    # تغییر زبان
+    if data == "open_lang_menu" and not is_group:
+        send_lang_selection_menu(chat_id, user_id, query.message.message_id)
+
+    elif data == "set_lang_fa" and not is_group:
+        _USER_LANG_CACHE[user_id] = "fa"
+        safe_kv_put(f"USER_LANG_{user_id}", "fa")
+        bot.answer_callback_query(query.id, "زبان روی فارسی تنظیم شد.")
+        send_main_menu(chat_id, user_id)
+
+    elif data == "set_lang_en" and not is_group:
+        _USER_LANG_CACHE[user_id] = "en"
+        safe_kv_put(f"USER_LANG_{user_id}", "en")
+        bot.answer_callback_query(query.id, "Language set to English.")
+        send_main_menu(chat_id, user_id)
+
     # سوئیچ بین ۳ بخش مستقل
-    if data == "switch_mode_chat":
+    elif data == "switch_mode_chat":
         _USER_MODES_CACHE[target_key_id] = "CHAT"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "CHAT")
         try:
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=get_main_menu_markup(user_id, "CHAT"))
         except Exception:
             pass
-        bot.send_message(chat_id, "💬 **بخش «پرسش و پاسخ و گفتگو» فعال شد.**\nاکنون هر سوال علمی، عمومی، ترجمه یا متنی دارید بنویسید.")
+        bot.send_message(chat_id, tr(user_id, "chat_mode_msg"), parse_mode="Markdown")
 
     elif data == "switch_mode_code":
         _USER_MODES_CACHE[target_key_id] = "CODE"
@@ -1719,7 +1871,7 @@ def handle_callbacks(query):
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=get_main_menu_markup(user_id, "CODE"))
         except Exception:
             pass
-        bot.send_message(chat_id, "💻 **بخش «کدنویسی و توسعه نرم‌افزار» فعال شد.**\nزبان برنامه‌نویسی یا اسکریپت مورد نظرتان را اعلام کنید تا کد کامل همراه با فایل برایتان آماده شود.")
+        bot.send_message(chat_id, tr(user_id, "code_mode_msg"), parse_mode="Markdown")
 
     elif data == "switch_mode_image":
         _USER_MODES_CACHE[target_key_id] = "IMAGE"
@@ -1728,7 +1880,7 @@ def handle_callbacks(query):
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=get_main_menu_markup(user_id, "IMAGE"))
         except Exception:
             pass
-        bot.send_message(chat_id, "🎨 **بخش «استودیو ساخت عکس» فعال شد.**\nتوصیف تصویری که می‌خواهید ساخته شود را بفرستید.\n\n*(هر زمان خواستید به چت برگردید، از منوی اصلی دکمه پرسش و پاسخ یا کدنویسی را بزنید)*")
+        bot.send_message(chat_id, tr(user_id, "image_mode_msg"), parse_mode="Markdown")
 
     # پیام به پشتیبانی
     elif data == "contact_admin" and not is_group:
@@ -1799,7 +1951,7 @@ def handle_callbacks(query):
             reply_markup=markup
         )
 
-    elif data in ["check_sponsor", "main_menu"]:
+    elif data == "main_menu":
         if not is_group:
             send_main_menu(chat_id, user_id)
 
@@ -1895,7 +2047,7 @@ def handle_callbacks(query):
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
         sessions.insert(0, {"id": new_sess, "title": "گفتگوی جدید 💬", "date": get_jalali_date()})
         safe_kv_put(f"SESSIONS_{user_id}", sessions)
-        bot.send_message(chat_id, "✨ چت جدید ایجاد شد! پیام خود را بفرستید.")
+        bot.send_message(chat_id, tr(user_id, "new_chat_msg"), parse_mode="Markdown")
 
     elif data.startswith("switch_sess_") and not is_group:
         sess_id = data.replace("switch_sess_", "")
@@ -1958,7 +2110,17 @@ def handle_callbacks(query):
 
     elif data == "admin_add_sponsor" and user_id == ADMIN_ID:
         safe_kv_put(f"ADMIN_STEP_{user_id}", "ADD_SPONSOR")
-        bot.send_message(chat_id, "📢 آیدی کانال اسپانسری را وارد کنید:")
+        bot.send_message(
+            chat_id,
+            "📢 **افزودن کانال اسپانسر:**\n\n"
+            "می‌توانید یوزرنیم کانال را به هر یک از فرمت‌های زیر بفرستید:\n"
+            "🔹 `neotenet`\n"
+            "🔹 `@neotenet`\n"
+            "🔹 `t.me/neotenet`\n"
+            "🔹 `https://t.me/neotenet`\n\n"
+            "*(ربات باید در کانال ادمین باشد)*",
+            parse_mode="Markdown"
+        )
 
     elif data == "admin_del_sponsor_menu" and user_id == ADMIN_ID:
         send_admin_sponsor_list(chat_id)
@@ -2136,16 +2298,19 @@ def handle_admin_steps(chat_id, user_id, text, step):
         bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", reply_markup=get_admin_panel_markup())
 
     elif step == "ADD_SPONSOR":
-        channels = get_sponsor_channels_cached()
-        ch_name = text.strip() if text.strip().startswith("@") else f"@{text.strip()}"
-        if ch_name not in channels:
-            channels.append(ch_name)
-            safe_kv_put("SPONSOR_CHANNELS", channels)
-            global _SPONSORS_CACHE
-            _SPONSORS_CACHE = channels
-        clear_user_state(user_id)
-        bot.send_message(chat_id, f"📢 کانال اسپانسر {ch_name} اضافه شد.")
-        bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", reply_markup=get_admin_panel_markup())
+        clean_ch = clean_channel_username(text)
+        if clean_ch:
+            channels = get_sponsor_channels_cached()
+            if clean_ch not in channels:
+                channels.append(clean_ch)
+                safe_kv_put("SPONSOR_CHANNELS", channels)
+                global _SPONSORS_CACHE
+                _SPONSORS_CACHE = channels
+            clear_user_state(user_id)
+            bot.send_message(chat_id, f"📢 کانال اسپانسر `{clean_ch}` با موفقیت اضافه شد.", parse_mode="Markdown")
+            bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", reply_markup=get_admin_panel_markup())
+        else:
+            bot.send_message(chat_id, "❌ یوزرنیم کانال نامعتبر است.")
 
     elif step == "BAN_USER":
         safe_kv_put(f"BANNED_{text.strip()}", "true")
@@ -2168,6 +2333,7 @@ if __name__ == "__main__":
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | SSE Streaming Active")
     print("🚀 Instant /start Enabled (< 0.2s)")
+    print("🌐 Bilingual Support Active (FA / EN)")
     print("=" * 45)
 
     try:
