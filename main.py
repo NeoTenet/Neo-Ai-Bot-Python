@@ -1,12 +1,16 @@
+
 # -*- coding: utf-8 -*-
 """
 Telegram AI Bot - Python + Upstash Redis (100% Safe, Bilingual & Instant)
 Configured for: Wispbyte / bot-hosting.net (Docker / Linux Environment)
 Architecture:
-1. 💬 Q&A & Chat Mode (Pure conversational assistant)
+1. 💬 Q&A & Chat Mode (Pure conversational assistant - No accidental code dumps)
 2. 💻 Coding & Dev Mode (Software engineering with clean source file delivery)
 3. 🎨 Image Generation Studio (Strict image prompts only)
 Features:
+- Fixed Capability Question Bug: "میتونی کد بنویسی؟" answered conversationally without code/files
+- Fixed Stopwatch 00:01 Freeze: 3.5s safe group edit rate avoids Telegram 429 flood limits
+- Advanced /models in Groups: Group Admins can toggle Group Mode (Chat/Code/Image) and AI models
 - Instantaneous /start response (< 0.2s) with zero blocking database latency
 - 100% Airtight Sponsor Join Verification (No bypass on verify click)
 - Clean RTL Channel Link Generator (Auto sanitizes t.me, @ and full URLs)
@@ -206,11 +210,11 @@ def format_session_date(d_str):
 # ==========================================
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "Token")
-ADMIN_ID = str(os.getenv("ADMIN_ID", "Admin Id"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "TOKEN")
+ADMIN_ID = str(os.getenv("ADMIN_ID", "ID ADMIN"))
 
-UPSTASH_URL = os.getenv("UPSTASH_URL", "Base url")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "Token datebase")
+UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious.upstash.io")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "gQAAAAAAA..........")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
@@ -296,7 +300,6 @@ def is_bot_globally_active():
     return res
 
 def clean_channel_username(raw_ch):
-    """پاکسازی هر نوع فرمت لینک و تبدیل آن به یوزرنیم خالص بدون خطای راست‌چین"""
     if not raw_ch:
         return ""
     clean = str(raw_ch).strip()
@@ -324,7 +327,7 @@ def get_sponsor_channels_cached():
     return channels
 
 # ==========================================
-# 🧠 تشخیص هوشمند احوالپرسی و قصد کاربر
+# 🧠 تشخیص هوشمند احوالپرسی، قصد کدنویسی و عکس
 # ==========================================
 def is_casual_greeting(text):
     if not text:
@@ -337,16 +340,47 @@ def is_casual_greeting(text):
     }
     return clean in greetings or any(clean.startswith(g + " ") for g in ['سلام', 'سلان', 'درود'])
 
-def is_coding_intent(text):
+def is_explicit_code_request(text):
+    """
+    تشخیص دقیق قصد برنامه‌نویسی.
+    پرسش‌های درباره توانایی (مانند «میتونی کد بنویسی؟») هرگز کد تلقی نمی‌شوند و به عنوان چت عادی پاسخ داده می‌شوند.
+    """
     if not text:
         return False
-    lower = text.lower()
-    coding_keywords = [
-        'کد', 'برنامه', 'اسکریپت', 'بنویس', 'پایتون', 'جاوا', 'html', 'css', 'sql', 'خطا',
-        'ارور', 'باگ', 'دیباگ', 'تابع', 'کلاس', 'کامپایل', 'الگوریتم', 'ریکوئست', 'api',
-        'function', 'class', 'def ', 'import ', 'var ', 'const ', 'code', 'script', 'bug', 'developer'
+    clean = text.strip()
+    lower = clean.lower()
+
+    # ۱. اگر سوال درباره توانایی ربات است («میتونی کد بنویسی؟»، «بلدی برنامه بنویسی؟»)، این مکالمه است نه دستور کد!
+    capability_triggers = [
+        'میتونی', 'می تونی', 'می‌تونی', 'میتونید', 'می‌تونید', 'بلدی', 'امکانش هست',
+        'میشه', 'میشه برام', 'آیا میتونی', 'آیا بلدی', 'می شود', 'چطور میشه', 'چگونه'
     ]
-    return any(k in lower for k in coding_keywords)
+    is_asking_ability = any(q in lower for q in capability_triggers) or ('؟' in clean or '?' in clean)
+    
+    # اگر سوال کلی است و هیچ زبان یا هدف خاصی مطرح نشده:
+    if is_asking_ability:
+        has_specific_task = any(tech in lower for tech in ['پایتون', 'جاوا', 'html', 'css', 'php', 'c++', 'sql', 'js', 'برام بنویس', 'رو بنویس'])
+        if not has_specific_task:
+            return False
+
+    # ۲. عبارات صریح و چندکلمه‌ای برنامه‌نویسی (دستور مستقیم کاربر)
+    explicit_coding_phrases = [
+        'سورس کد', 'کد پایتون', 'کد جاوا', 'کد html', 'کد css', 'کد php', 'کد js',
+        'کد c++', 'کد نویسی', 'کدنویسی', 'اسکریپت پایتون', 'برنامه پایتون',
+        'برنامه نویسی', 'دیباگ کن', 'باگ این کد', 'ارور این کد', 'خطای این کد',
+        'تابع پایتون', 'الگوریتم پایتون', 'یک کد بنویس', 'کد زیر رو', 'کد زیر را'
+    ]
+    if any(phrase in lower for phrase in explicit_coding_phrases):
+        return True
+
+    # ۳. کلمه مستقل «کد» با تطابق مرز کلمه
+    has_exact_word_code = bool(re.search(r'(?:^|[\s\.,;:!؟])کد(?:$|[\s\.,;:!؟])', clean))
+    if has_exact_word_code:
+        coding_actions = ['بنویس', 'طراحی کن', 'درست کن', 'بزن', 'حل کن', 'دیباگ', 'پایتون', 'جاوا', 'ارور', 'باگ']
+        if any(act in lower for act in coding_actions) and not is_asking_ability:
+            return True
+
+    return False
 
 def detect_image_intent(text):
     if not text:
@@ -365,7 +399,7 @@ def detect_image_intent(text):
             prompt = re.sub(r'^(?:please\s+)?(?:make|draw|paint|generate|create)\s+(?:a|an|the)?\s*(?:image|photo|picture)?\s*(?:of)?\s*', '', clean, flags=re.IGNORECASE)
             return True, prompt.strip() or clean
 
-    if is_coding_intent(clean) or any(g in lower for g in ['توضیح', 'چیست', 'کیست', 'چرا', 'چطور', 'چگونه', 'ترجمه', 'متن', 'مقاله', 'سلام']):
+    if is_explicit_code_request(clean) or any(g in lower for g in ['توضیح', 'چیست', 'کیست', 'چرا', 'چطور', 'چگونه', 'ترجمه', 'متن', 'مقاله', 'سلام']):
         return False, clean
 
     has_visual_noun = any(n in clean for n in ["عکس", "تصویر", "نقاشی", "والپیپر"])
@@ -418,7 +452,6 @@ def track_user_activity(user_id):
     threading.Thread(target=_worker, daemon=True).start()
 
 def clear_user_state(user_id):
-    """پاکسازی فوری تمام متغیرها در یک دستور تکی ردیس"""
     keys = [
         f"ADMIN_STEP_{user_id}", f"TEMP_MODEL_{user_id}",
         f"TEMP_IMG_{user_id}", f"ADMIN_EDIT_IDX_{user_id}",
@@ -438,7 +471,6 @@ def is_group_admin(chat_id, user_id):
         return False
 
 def check_sponsor_join(user_id):
-    """بررسی زنده و تضمینی عضویت در کانال‌های اسپانسر بدون امکان دور زدن"""
     if str(user_id) == str(ADMIN_ID):
         return True, []
         
@@ -533,7 +565,8 @@ def process_code_and_text(raw_text):
     if matches:
         for idx, (lang, code_content) in enumerate(matches, 1):
             clean_code = code_content.strip()
-            if len(clean_code) < 100 and clean_code.count('\n') < 5:
+            # ارتقای حداقل طول برای جلوگیری از ارسال فایل در کدهای کوچک یا مکالمات عادی
+            if len(clean_code) < 180 and clean_code.count('\n') < 8:
                 continue
 
             lang_clean = lang.strip().lower()
@@ -638,7 +671,6 @@ def send_lang_selection_menu(chat_id, user_id, message_id=None):
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
 def build_sponsor_markup(user_id, unjoined_channels):
-    """ساخت کیبورد شیشه‌ای کانال‌های اسپانسر با لینک مستقیم و چیدمان بدون ایراد RTL"""
     markup = types.InlineKeyboardMarkup(row_width=1)
     for ch in unjoined_channels:
         clean_ch = clean_channel_username(ch)
@@ -701,21 +733,48 @@ def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
     chat_name = chat_models[cur_chat_idx].get("name") if cur_chat_idx < len(chat_models) else "تعریف نشده"
     img_name = img_models[cur_img_idx].get("name") if cur_img_idx < len(img_models) else "تعریف نشده"
 
-    text = (
-        "✨ **منوی جامع انتخاب مدل‌های هوش مصنوعی**\n\n"
-        f"💬 مدل فعال چت و کدنویسی: **{chat_name}**\n"
-        f"🎨 مدل فعال ساخت عکس: **{img_name}**\n\n"
-        "بخش مورد نظر را برای تغییر مدل انتخاب کنید:"
-    )
+    current_mode = get_user_current_mode(target_key_id)
+    mode_names = {"CHAT": "💬 پرسش و پاسخ (چت عادی)", "CODE": "💻 کدنویسی و توسعه نرم‌افزار", "IMAGE": "🎨 استودیوی ساخت عکس"}
+    cur_mode_name = mode_names.get(current_mode, "💬 پرسش و پاسخ")
+
+    if is_group:
+        text = (
+            "✨ **منوی جامع مدیریت مدل‌ها و حالت ربات در گروه**\n\n"
+            f"🎯 **حالت فعال گروه:** `{cur_mode_name}`\n"
+            f"💬 مدل فعال چت و کدنویسی: **{chat_name}**\n"
+            f"🎨 مدل فعال ساخت عکس: **{img_name}**\n\n"
+            "ادمین گرامی، بخش مورد نظر را جهت تغییر انتخاب کنید:"
+        )
+    else:
+        text = (
+            "✨ **منوی جامع انتخاب مدل‌های هوش مصنوعی**\n\n"
+            f"💬 مدل فعال چت و کدنویسی: **{chat_name}**\n"
+            f"🎨 مدل فعال ساخت عکس: **{img_name}**\n\n"
+            "بخش مورد نظر را برای تغییر مدل انتخاب کنید:"
+        )
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("💬 مدل‌های چت و کدنویسی", callback_data="models_cat_chat", style="primary"),
-        types.InlineKeyboardButton("🎨 مدل‌های ساخت عکس", callback_data="models_cat_image", style="success")
-    )
     if is_group:
+        c_chk = "✅ " if current_mode == "CHAT" else ""
+        co_chk = "✅ " if current_mode == "CODE" else ""
+        im_chk = "✅ " if current_mode == "IMAGE" else ""
+        markup.add(
+            types.InlineKeyboardButton(f"{c_chk}💬 چت گروه", callback_data="switch_group_chat", style="primary"),
+            types.InlineKeyboardButton(f"{co_chk}💻 کد گروه", callback_data="switch_group_code", style="primary")
+        )
+        markup.add(
+            types.InlineKeyboardButton(f"{im_chk}🎨 عکس گروه", callback_data="switch_group_image", style="success")
+        )
+        markup.add(
+            types.InlineKeyboardButton("💬 مدل‌های چت و کدنویسی", callback_data="models_cat_chat", style="primary"),
+            types.InlineKeyboardButton("🎨 مدل‌های ساخت عکس", callback_data="models_cat_image", style="success")
+        )
         markup.add(types.InlineKeyboardButton("❌ بستن منو", callback_data="close_menu", style="danger"))
     else:
+        markup.add(
+            types.InlineKeyboardButton("💬 مدل‌های چت و کدنویسی", callback_data="models_cat_chat", style="primary"),
+            types.InlineKeyboardButton("🎨 مدل‌های ساخت عکس", callback_data="models_cat_image", style="success")
+        )
         markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu"))
 
     if message_id:
@@ -1006,7 +1065,7 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     bot.send_message(chat_id, list_text, reply_markup=markup)
 
 # ==========================================
-# ۳. پردازش چت و کدنویسی
+# ۳. پردازش چت و کدنویسی (با کرنومتر فوق پایدار و ضد فریز)
 # ==========================================
 def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id, thread_id=None, active_mode="CHAT"):
     models = json.loads(safe_kv_get("AI_MODELS") or "[]")
@@ -1053,10 +1112,13 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
     api_response_text = None
     start_time = time.time()
 
+    # کرنومتر ایمن: ۳.۵ ثانیه در گروه‌ها برای مهار کامل محدودیت ۴۲۹ تلگرام
     def timer_loop():
         last_edit_time = 0
+        edit_interval = 3.5 if is_group else 2.5
+
         while not is_done:
-            time.sleep(1.2)
+            time.sleep(1.0)
             if is_done or (req_id in _CANCEL_REQS):
                 break
 
@@ -1065,7 +1127,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             if elapsed >= 2100:
                 break
 
-            if now - last_edit_time >= 2.4:
+            if now - last_edit_time >= edit_interval:
                 mins = elapsed // 60
                 secs = elapsed % 60
                 time_display = f"{mins:02d}:{secs:02d}"
@@ -1076,10 +1138,14 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                     last_edit_time = now
                 except ApiTelegramException as te:
                     if te.error_code == 429:
-                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
+                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 4)
                         last_edit_time = now + wait_time
+                    elif "message is not modified" in str(te).lower():
+                        last_edit_time = now
+                    else:
+                        last_edit_time = now + 2
                 except Exception:
-                    pass
+                    last_edit_time = now + 2
 
     threading.Thread(target=timer_loop, daemon=True).start()
 
@@ -1140,7 +1206,8 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 f"You are {active_model.get('name')}, an intelligent and friendly AI assistant. "
                 f"CRITICAL INSTRUCTIONS:\n"
                 f"1. Answer questions, chat, explain, and converse clearly in natural {target_lang_str}.\n"
-                f"2. NEVER output internal monologue, notes, or <think> tags."
+                f"2. If the user asks about your capabilities (e.g. 'Can you write code?'), answer politely and conversationally. Do NOT output code snippets or markdown codeblocks unless you are answering an actual programming request.\n"
+                f"3. NEVER output internal monologue, notes, or <think> tags."
             )
 
         system_prompt = {"role": "system", "content": system_prompt_content}
@@ -1252,16 +1319,19 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
         send_safe_ai_response(chat_id, status_msg_id, final_text, reply_to, thread_id)
         
-        if active_mode == "CODE":
-            for filename, byte_data, ext in code_files:
-                send_code_document_safe(
-                    chat_id=chat_id,
-                    byte_data=byte_data,
-                    filename=filename,
-                    ext=ext,
-                    reply_to_id=status_msg_id,
-                    thread_id=thread_id
-                )
+        # در حالت چت معمولی یا مکالمه در گروه به هیچ وجه فایل اسکریپت فرستاده نمی‌شود
+        if active_mode == "CODE" and code_files:
+            should_send_file = not is_group or any(w in text_prompt.lower() for w in ['فایل', 'دانلود', 'file', 'script', 'اسکریپت'])
+            if should_send_file:
+                for filename, byte_data, ext in code_files:
+                    send_code_document_safe(
+                        chat_id=chat_id,
+                        byte_data=byte_data,
+                        filename=filename,
+                        ext=ext,
+                        reply_to_id=status_msg_id,
+                        thread_id=thread_id
+                    )
     else:
         if req_id not in _CANCEL_REQS and safe_kv_get(f"CANCEL_{req_id}") != "true":
             try:
@@ -1306,8 +1376,10 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
 
     def timer_loop():
         last_edit_time = 0
+        edit_interval = 3.5
+
         while not is_done:
-            time.sleep(1.2)
+            time.sleep(1.0)
             if is_done or (req_id in _CANCEL_REQS):
                 break
 
@@ -1316,7 +1388,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
             if elapsed >= 2100:
                 break
 
-            if now - last_edit_time >= 2.4:
+            if now - last_edit_time >= edit_interval:
                 mins = elapsed // 60
                 secs = elapsed % 60
                 time_display = f"{mins:02d}:{secs:02d}"
@@ -1331,10 +1403,14 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                     last_edit_time = now
                 except ApiTelegramException as te:
                     if te.error_code == 429:
-                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
+                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 4)
                         last_edit_time = now + wait_time
+                    elif "message is not modified" in str(te).lower():
+                        last_edit_time = now
+                    else:
+                        last_edit_time = now + 2
                 except Exception:
-                    pass
+                    last_edit_time = now + 2
 
     threading.Thread(target=timer_loop, daemon=True).start()
 
@@ -1452,17 +1528,13 @@ def handle_start_command(msg):
         )
         return
 
-    # بررسی تضمینی عضویت در کانال‌های اسپانسر
     ok_sponsor, unjoined = check_sponsor_join(user_id)
     if not ok_sponsor and ADMIN_ID and user_id != ADMIN_ID:
         markup = build_sponsor_markup(user_id, unjoined)
         bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
         return
 
-    # پاکسازی وضعیت‌های موقت در پس‌زمینه
     threading.Thread(target=clear_user_state, args=(user_id,), daemon=True).start()
-    
-    # ارسال فوری منو
     send_main_menu(chat_id, user_id)
 
 # ==========================================
@@ -1619,7 +1691,7 @@ def handle_all_messages(msg):
                 handle_admin_steps(chat_id, user_id, text, admin_step)
                 return
 
-    # بررسی مجدد اسپانسر برای پیام‌های معمولی در پیوی
+    # بررسی اسپانسر در پیوی
     if not is_group:
         ok_sponsor, unjoined = check_sponsor_join(user_id)
         if not ok_sponsor and ADMIN_ID and user_id != ADMIN_ID:
@@ -1627,10 +1699,11 @@ def handle_all_messages(msg):
             bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
             return
 
+    # دستور /models در گروه یا پیوی
     if text.startswith("/models"):
         if is_group:
             if not is_group_admin(chat_id, user_id):
-                bot.reply_to(msg, "⛔ تغییر مدل‌های ربات در گروه فقط توسط ادمین مجاز است.", allow_sending_without_reply=True)
+                bot.reply_to(msg, "⛔ تغییر تنظیمات و مدل‌های ربات در گروه فقط توسط ادمین امکان‌پذیر است.", allow_sending_without_reply=True)
                 return
         elif ADMIN_ID and user_id != ADMIN_ID:
             bot.send_message(chat_id, "⛔ این دستور تنها برای ادمین ربات مجاز است.")
@@ -1730,36 +1803,37 @@ def handle_all_messages(msg):
                 text = f'[پیام ({target_name}): "{replied_text}"]\n\nدستور:\n{prompt_inst}'
 
     # ==============================================================
-    # 🎯 تفکیک ۳ گانه و قطعی (پرسش و پاسخ | کدنویسی | ساخت عکس)
-    # ==============================================================
+    # 🎯 تفکیک ۳ گانه بدون قفل شدن گروه روی حالت کدنویسی
+    # ==========================================
     has_photo_attached = bool(msg.photo or (msg.reply_to_message and msg.reply_to_message.photo))
     active_mode = get_user_current_mode(target_key_id)
     
-    # ۱. اولویت قطعی کدنویسی
-    is_code = is_coding_intent(text)
+    # بررسی دقیق قصد کدنویسی
+    is_code = is_explicit_code_request(text)
     
-    # ۲. قصد ساخت عکس
+    # قصد ساخت عکس
     is_img_prompt, clean_img_prompt = detect_image_intent(text) if not has_photo_attached else (False, text)
 
-    # قانون ۱: اگر کدنویسی است، عکس اجرا نشود
+    # قانون شماره ۱: فقط در صورتی کد تولید شود که دستور قطعی نوشتن برنامه باشد نه سوال درباره توانایی!
     if is_code:
-        _USER_MODES_CACHE[target_key_id] = "CODE"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
+        if not is_group:
+            _USER_MODES_CACHE[target_key_id] = "CODE"
+            safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
         threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE"), daemon=True).start()
         return
 
-    # قانون ۲: ساخت عکس تنها در صورت درخواست مستقیم یا حالت فعال عکس
+    # قانون شماره ۲: ساخت تصویر (فقط در صورت دستور صریح عکس یا قرار داشتن در حالت تصویرساز)
     if (active_mode == "IMAGE" or is_img_prompt) and not has_photo_attached:
         img_prompt_to_use = clean_img_prompt if is_img_prompt else text
         threading.Thread(target=worker_image_process, args=(chat_id, user_id, img_prompt_to_use, target_key_id, thread_id), daemon=True).start()
         return
 
-    # قانون ۳: پاسخ متنی هوشمند چت یا کد
+    # قانون شماره ۳: پاسخگویی به چت و مکالمه عادی (پیش‌فرض امن - بدون نوشتن کد و بدون ساخت عکس)
     current_ai_mode = "CODE" if active_mode == "CODE" else "CHAT"
     threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode), daemon=True).start()
 
 # ==========================================
-# ۶. هندلر دکمه‌های شیشه‌ای و سوییچ لحظه‌ای ۳ حالت و تایید اسپانسر
+# ۶. هندلر دکمه‌های شیشه‌ای و سوئیچ حالت‌ها در گروه و پیوی
 # ==========================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(query):
@@ -1790,9 +1864,7 @@ def handle_callbacks(query):
             pass
         return
 
-    # ==========================================
-    # 🔒 تایید عضویت اسپانسر بدون امکان دور زدن
-    # ==========================================
+    # تایید عضویت اسپانسر
     if data == "check_sponsor" and not is_group:
         ok_sponsor, unjoined = check_sponsor_join(user_id)
         if not ok_sponsor:
@@ -1816,13 +1888,17 @@ def handle_callbacks(query):
             send_main_menu(chat_id, user_id)
             return
 
+    # مدیریت دکمه‌های مجاز در گروه برای ادمین
     if is_group:
-        group_allowed_actions = ["models_hub", "models_cat_chat", "models_cat_image", "close_menu"]
+        group_allowed_actions = [
+            "models_hub", "models_cat_chat", "models_cat_image", "close_menu",
+            "switch_group_chat", "switch_group_code", "switch_group_image"
+        ]
         is_set_action = data.startswith("set_model_") or data.startswith("set_img_model_")
 
         if data in group_allowed_actions or is_set_action:
             if not is_group_admin(chat_id, user_id):
-                bot.answer_callback_query(query.id, "⛔ تغییر مدل در گروه فقط توسط ادمین امکان‌پذیر است!", show_alert=True)
+                bot.answer_callback_query(query.id, "⛔ تغییر تنظیمات و مدل‌های ربات در گروه فقط توسط ادمین امکان‌پذیر است!", show_alert=True)
                 return
 
         pv_only = ["main_menu", "history_menu", "new_chat", "switch_mode_chat", "switch_mode_code", "switch_mode_image", "contact_admin", "open_lang_menu"]
@@ -1837,6 +1913,29 @@ def handle_callbacks(query):
 
     if data in ["main_menu", "history_menu", "new_chat"]:
         clear_user_state(user_id)
+
+    # سوئیچ حالت گروه توسط ادمین در /models
+    if is_group:
+        if data == "switch_group_chat":
+            _USER_MODES_CACHE[target_key_id] = "CHAT"
+            safe_kv_put(f"BOT_MODE_{target_key_id}", "CHAT")
+            send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
+            bot.send_message(chat_id, "💬 **حالت ربات در این گروه روی «پرسش و پاسخ و گفتگو» تنظیم شد.**")
+            return
+
+        elif data == "switch_group_code":
+            _USER_MODES_CACHE[target_key_id] = "CODE"
+            safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
+            send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
+            bot.send_message(chat_id, "💻 **حالت ربات در این گروه روی «کدنویسی و توسعه نرم‌افزار» تنظیم شد.**")
+            return
+
+        elif data == "switch_group_image":
+            _USER_MODES_CACHE[target_key_id] = "IMAGE"
+            safe_kv_put(f"BOT_MODE_{target_key_id}", "IMAGE")
+            send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
+            bot.send_message(chat_id, "🎨 **حالت ربات در این گروه روی «استودیو ساخت عکس» تنظیم شد.**")
+            return
 
     # تغییر زبان
     if data == "open_lang_menu" and not is_group:
@@ -1854,8 +1953,8 @@ def handle_callbacks(query):
         bot.answer_callback_query(query.id, "Language set to English.")
         send_main_menu(chat_id, user_id)
 
-    # سوئیچ بین ۳ بخش مستقل
-    elif data == "switch_mode_chat":
+    # سوئیچ بین ۳ بخش مستقل در پیوی
+    elif data == "switch_mode_chat" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "CHAT"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "CHAT")
         try:
@@ -1864,7 +1963,7 @@ def handle_callbacks(query):
             pass
         bot.send_message(chat_id, tr(user_id, "chat_mode_msg"), parse_mode="Markdown")
 
-    elif data == "switch_mode_code":
+    elif data == "switch_mode_code" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "CODE"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
         try:
@@ -1873,7 +1972,7 @@ def handle_callbacks(query):
             pass
         bot.send_message(chat_id, tr(user_id, "code_mode_msg"), parse_mode="Markdown")
 
-    elif data == "switch_mode_image":
+    elif data == "switch_mode_image" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "IMAGE"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "IMAGE")
         try:
