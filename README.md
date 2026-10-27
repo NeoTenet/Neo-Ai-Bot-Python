@@ -30,8 +30,10 @@
 
 🔴چند هاست رایگان پایتون برای ساخت ربات های تلگرام 
 
- 🔘botkeep.cloud
- 🔘wispbyte.com
+ 
+     🔘https://botkeep.cloud
+ 
+       🔘https://wispbyte.com
 
   🔘 ویدیو ساخت و راه اندازی ربات روی هاست رایگان 
 
