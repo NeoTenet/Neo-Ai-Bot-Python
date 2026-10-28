@@ -302,11 +302,11 @@ def format_session_display(session, user_id):
 # ⚙️ تنظیمات اصلی و اطلاعات دیتابیس Upstash
 # ==========================================
 # Keep credentials outside source control. Configure these in the hosting provider's environment.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "Token")
-ADMIN_ID = str(os.getenv("ADMIN_ID", "Admin"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8970181549")
+ADMIN_ID = str(os.getenv("ADMIN_ID", "1033000000"))
 
-UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious.upstash.io")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "gQAAAAAAA.......................")
+UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious-chimpupstash.io")
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "gQAAAAAAA0eEEeeeeeee")
 
 bot = telebot.TeleBot(BOT_TOKEN or "0:REPLACE_WITH_BOT_TOKEN", parse_mode=None)
 
@@ -1981,7 +1981,7 @@ def send_bot_stats(chat_id):
     inactive_count = len(get_admin_status_user_ids("inactive"))
     banned_count = len(get_admin_status_user_ids("banned"))
     unreachable_count = len(get_admin_status_user_ids("unreachable"))
-    status_str = "🟢 روشن و فعال" if is_bot_globally_active() else "🔴 خاموش (متوقف)"
+    status_str = "🟢 روشن و فعال" if is_bot_globally_active() else "?? خاموش (متوقف)"
     text = (
         f"📊 **آمار جامع کاربران و وضعیت ربات:**\n\n"
         f"⚡ وضعیت ربات: **{status_str}**\n"
@@ -3766,7 +3766,11 @@ def handle_all_messages(msg):
 
         if is_reply_to_other_human:
             has_bot_mention = f"@{bot_username}" in lower_text
-            has_unique_call = bool(re.match(r'^(نئو|نعو|neo|tenet)[\s:,،\n]+', text.strip(), flags=re.IGNORECASE))
+            # Replies to a human may still invoke the bot with any supported prefix.
+            has_unique_call = bool(re.match(
+                r'^(?:نئو|نعو|neo|tenet|ربات|روبات|بات)\b[\s:,،\n]*',
+                text.strip(), flags=re.IGNORECASE
+            ))
             if not has_bot_mention and not has_unique_call:
                 return
 
@@ -3860,6 +3864,37 @@ def handle_all_messages(msg):
         is_code = False
     
     is_img_prompt, clean_img_prompt = detect_and_extract_image_prompt(text) if not has_photo_attached else (False, text)
+
+    # اگر کاربر در گروه با کلیدواژهٔ ربات درخواست ساخت عکس بدهد ولی توضیحی ننویسد،
+    # درخواست را گم نکن؛ توضیح را بخواه و پاسخ بعدیِ ریپلای‌شده به ربات را به ساخت عکس بده.
+    bare_image_request = bool(re.fullmatch(
+        r"\s*(?:(?:لطفاً|لطفا|بی\s*زحمت|برام|برای\s*من)\s*)?(?:(?:یه|یک|این)\s*)?"
+        r"(?:عکس|تصویر|نقاشی|طرح|پوستر|والپیپر|آرت|طراحی)\s*(?:رو|را)?\s*"
+        r"(?:بساز|بکش|طراحی\s*کن|نقاشی\s*کن|تولید\s*کن|تصویرسازی\s*کن|خلق\s*کن|ایجاد\s*کن)\s*[.!؟،,]*\s*",
+        text or "", flags=re.IGNORECASE
+    ))
+    awaiting_img_key = f"AWAITING_IMG_{target_key_id}"
+    awaiting_image_prompt = safe_kv_get(awaiting_img_key) == "true"
+
+    if awaiting_image_prompt and not has_photo_attached and (text or "").strip():
+        safe_kv_delete(awaiting_img_key)
+        is_img_prompt = True
+        clean_img_prompt = text.strip()
+
+    if bare_image_request and not has_photo_attached:
+        safe_kv_put(awaiting_img_key, "true", expiration_ttl=600)
+        ask_prompt = (
+            "🎨 حتماً عزیزم! توضیح بده چه عکسی بسازم.\n"
+            "مثلاً: «ماه کامل در آسمان شب، سبک واقع‌گرایانه».\n"
+            "پیامت را در پاسخ به همین پیام بفرست."
+        ) if get_user_lang(user_id) == "fa" else (
+            "🎨 Sure! Describe the image you want me to create.\n"
+            "For example: “A full moon in the night sky, photorealistic style.”\n"
+            "Reply to this message with your prompt."
+        )
+        bot.send_message(chat_id, ask_prompt, reply_to_message_id=msg.message_id,
+                         allow_sending_without_reply=True, message_thread_id=thread_id)
+        return
 
     # ۱. تولید کد
     if is_code:
