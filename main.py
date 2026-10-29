@@ -121,7 +121,7 @@ _IMAGE_MODELS_CACHE = None
 _IMAGE_MODELS_CACHE_TIME = 0
 _VIDEO_MODELS_CACHE = None
 _VIDEO_MODELS_CACHE_TIME = 0
-_MODEL_REGISTRY_CACHE_TTL = 120.0
+_MODEL_REGISTRY_CACHE_TTL = 600.0
 
 _THINK_TAG_REGEX = re.compile(r'<think>[\s\S]*?</think>', flags=re.IGNORECASE)
 _CODE_BLOCK_REGEX = re.compile(r'```([a-zA-Z0-9_+-]*)[^\n]*\r?\n([\s\S]*?)```')
@@ -445,6 +445,7 @@ IMAGE_JOB_QUEUE_LIMIT = _env_int("IMAGE_JOB_QUEUE_LIMIT", 1000, 4, 2048)
 VIDEO_JOB_WORKERS = _env_int("VIDEO_JOB_WORKERS", 1, 1, 4)
 VIDEO_JOB_QUEUE_LIMIT = _env_int("VIDEO_JOB_QUEUE_LIMIT", 1000, 2, 2048)
 API_TIMEOUT_SECONDS = _env_int("API_TIMEOUT_SECONDS", 3600, 60, 7200)
+API_CONNECT_TIMEOUT_SECONDS = _env_int("API_CONNECT_TIMEOUT_SECONDS", 15, 3, 120)
 
 # Keep small settings writes off interactive callback threads; one worker preserves write order.
 _SETTINGS_PERSIST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo-settings-persist")
@@ -539,6 +540,22 @@ http_session = requests.Session()
 adapter = TCPKeepAliveAdapter(pool_connections=30, pool_maxsize=60)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
+
+# Use a persistent per-worker session for model APIs. Redis and image/video traffic use
+# the general session above; keeping model connections isolated avoids pool contention
+# and reuses TLS connections between requests handled by the same AI worker.
+_API_HTTP_LOCAL = threading.local()
+
+def get_api_http_session():
+    session = getattr(_API_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        api_adapter = TCPKeepAliveAdapter(pool_connections=12, pool_maxsize=4)
+        session.mount("https://", api_adapter)
+        session.mount("http://", api_adapter)
+        session.headers.update({"Connection": "keep-alive"})
+        _API_HTTP_LOCAL.session = session
+    return session
 
 # ==========================================
 # ۰. توابع کمکی دیتابیس Upstash Redis
@@ -3103,6 +3120,127 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     bot.send_message(chat_id, list_text, reply_markup=markup)
 
 # ==========================================
+# ⚡ آماده‌سازی سریع زمینهٔ AI با یک MGET دسته‌ای
+# ==========================================
+def _prepare_ai_context_fast(user_id, target_key_id, is_group, active_mode, chat_id):
+    """Resolve language, session id and model selection with one batched Redis read.
+
+    Previously cold caches could trigger sequential Redis REST calls for language,
+    active session, session list and model selection before the AI API was contacted.
+    This combines cold state lookups and persists a newly-created empty session in the
+    background, while still loading existing conversation history before making a prompt.
+    """
+    total_started = time.monotonic()
+    uid = str(user_id)
+    now = time.monotonic()
+
+    lang_cached = _USER_LANG_CACHE.get(uid)
+    lang_cache_hit = lang_cached in ("fa", "en")
+    if not lang_cache_hit:
+        lang_cached = None
+
+    active_session_id = None
+    session_cache_hit = False
+    if not is_group:
+        active_session_id = _get_active_session_cache(uid)
+        session_cache_hit = bool(active_session_id)
+
+    if active_mode == "CODE":
+        selection_keys = [f"USER_CODE_MODEL_{target_key_id}", f"USER_MODEL_{target_key_id}", f"USER_MODEL_{uid}"]
+    else:
+        selection_keys = [f"USER_MODEL_{target_key_id}", f"USER_MODEL_{uid}"]
+
+    selection_values = {}
+    missing_keys = []
+    selection_cache_hits = 0
+    with _MODEL_SELECTION_CACHE_LOCK:
+        for key in selection_keys:
+            cached = _MODEL_SELECTION_CACHE.get(key)
+            if cached and (now - cached[0]) < _MODEL_SELECTION_CACHE_TTL:
+                selection_values[key] = str(cached[1])
+                selection_cache_hits += 1
+            else:
+                missing_keys.append(key)
+
+    # A single MGET carries all cold preflight fields. Include SESSIONS only when the
+    # active-session cache is cold; this lets us recover an existing active session
+    # without serializing several REST requests.
+    batch_keys = list(missing_keys)
+    if not lang_cache_hit:
+        batch_keys.append(f"USER_LANG_{uid}")
+    if not is_group and not session_cache_hit:
+        batch_keys.extend((f"ACTIVE_SESSION_{uid}", f"SESSIONS_{uid}"))
+
+    fetched = batch_kv_get(list(dict.fromkeys(batch_keys))) if batch_keys else {}
+
+    if not lang_cache_hit:
+        lang = str(fetched.get(f"USER_LANG_{uid}") or "fa")
+        if lang not in ("fa", "en"):
+            lang = "fa"
+        _USER_LANG_CACHE[uid] = lang
+    else:
+        lang = lang_cached
+
+    for key in missing_keys:
+        value = fetched.get(key)
+        stored_value = str(value) if value not in (None, "") else "0"
+        selection_values[key] = stored_value
+        with _MODEL_SELECTION_CACHE_LOCK:
+            _MODEL_SELECTION_CACHE[key] = (time.monotonic(), stored_value)
+
+    if not is_group:
+        if not active_session_id:
+            active_session_id = str(fetched.get(f"ACTIVE_SESSION_{uid}") or "").strip()
+            if active_session_id:
+                _set_active_session_cache(uid, active_session_id)
+            else:
+                sessions_raw = fetched.get(f"SESSIONS_{uid}")
+                try:
+                    parsed_sessions = json.loads(sessions_raw or "[]")
+                    sessions = [item for item in parsed_sessions if isinstance(item, dict) and item.get("id")] if isinstance(parsed_sessions, list) else []
+                except Exception:
+                    sessions = []
+                if sessions:
+                    active_session_id = str(sessions[0]["id"])
+                    _set_active_session_cache(uid, active_session_id)
+                    _persist_kv_async(f"ACTIVE_SESSION_{uid}", active_session_id)
+                else:
+                    # No prior session exists: create an empty local session immediately
+                    # and persist metadata asynchronously instead of blocking on several
+                    # sequential Upstash calls before contacting the model API.
+                    active_session_id = f"sess_{time.time_ns()}"
+                    new_session = make_session_record(active_session_id)
+                    _set_active_session_cache(uid, active_session_id)
+                    _persist_kv_async(f"ACTIVE_SESSION_{uid}", active_session_id)
+                    _persist_kv_async(f"SESSIONS_{uid}", [new_session])
+                    _history_cache_put(f"HISTORY_{uid}_{active_session_id}", [])
+        history_key = f"HISTORY_{uid}_{active_session_id}"
+    else:
+        active_session_id = None
+        history_key = f"GROUP_HISTORY_{chat_id}_{uid}"
+
+    user_selected = next(
+        (str(selection_values.get(key)) for key in selection_keys if selection_values.get(key) not in (None, "")),
+        "0",
+    )
+
+    history_started = time.monotonic()
+    with _CHAT_HISTORY_CACHE_LOCK:
+        cached_history_item = _CHAT_HISTORY_CACHE.get(history_key)
+        history_cache_hit = bool(cached_history_item and history_started - cached_history_item[0] < _CHAT_HISTORY_CACHE_TTL)
+    history = _load_chat_history(history_key)
+    state_elapsed = history_started - total_started
+    history_elapsed = time.monotonic() - history_started
+    print(
+        f"[AI Timing] preflight user={uid} group={is_group} "
+        f"state={state_elapsed:.2f}s history={history_elapsed:.2f}s total={time.monotonic()-total_started:.2f}s "
+        f"lang_cache={int(lang_cache_hit)} session_cache={int(session_cache_hit)} "
+        f"selection_cache={selection_cache_hits}/{len(selection_keys)} history_cache={int(history_cache_hit)}"
+    )
+    return active_session_id, history_key, lang, selection_values, user_selected, history
+
+
+# ==========================================
 # ۳. پردازش هوش مصنوعی با وضعیت ثابت و وب‌گردی فنی
 # ==========================================
 def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_id, is_group,
@@ -3133,44 +3271,11 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
         print(f"[AI Worker Error] user={user_id}: could not create a Telegram status message")
         return
 
-    # Only fetch the registry needed for this mode; the old path fetched both on every chat request.
+    # Only fetch the registry needed for this mode; model registries are warmed at startup.
     chat_models = get_ai_models_cached()
     models = (get_code_models_cached() or chat_models) if active_mode == "CODE" else chat_models
-    # Group requests must not load or rewrite an individual's private-session metadata.
-    # Their history is scoped to the group and uses one GET + one SET per completed turn.
-    if is_group:
-        active_session_id = None
-        history_key = f"GROUP_HISTORY_{chat_id}_{user_id}"
-    else:
-        active_session_id = get_or_create_active_session(user_id)
-        history_key = f"HISTORY_{user_id}_{active_session_id}"
-    lang = get_user_lang(user_id)
-
-    if active_mode == "CODE":
-        selection_keys = [f"USER_CODE_MODEL_{target_key_id}", f"USER_MODEL_{target_key_id}", f"USER_MODEL_{user_id}"]
-    else:
-        selection_keys = [f"USER_MODEL_{target_key_id}", f"USER_MODEL_{user_id}"]
-    selection_values = {}
-    missing_selection_keys = []
-    now_selection_cache = time.monotonic()
-    with _MODEL_SELECTION_CACHE_LOCK:
-        for selection_key in selection_keys:
-            cached_selection = _MODEL_SELECTION_CACHE.get(selection_key)
-            if cached_selection and (now_selection_cache - cached_selection[0]) < _MODEL_SELECTION_CACHE_TTL:
-                selection_values[selection_key] = cached_selection[1]
-            else:
-                missing_selection_keys.append(selection_key)
-    if missing_selection_keys:
-        fetched_selection_values = batch_kv_get(missing_selection_keys)
-        for selection_key, selection_value in fetched_selection_values.items():
-            stored_value = str(selection_value) if selection_value not in (None, "") else "0"
-            selection_values[selection_key] = stored_value
-            with _MODEL_SELECTION_CACHE_LOCK:
-                _MODEL_SELECTION_CACHE[selection_key] = (time.monotonic(), stored_value)
-    user_selected = next(
-        (str(selection_values.get(key)) for key in selection_keys if selection_values.get(key) not in (None, "")),
-        "0",
-    )
+    (active_session_id, history_key, lang, selection_values, user_selected,
+     history) = _prepare_ai_context_fast(user_id, target_key_id, is_group, active_mode, chat_id)
 
     try:
         model_idx = int(user_selected)
@@ -3235,6 +3340,8 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
     status_msg_id = status_msg.message_id
     api_response_text = None
     source_links = []
+    res = None
+    retry_res = None
 
     try:
         web_context_prompt = ""
@@ -3248,7 +3355,6 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
                 "answer from existing knowledge only and clearly state this limitation when current web facts are required."
             )
 
-        history = _load_chat_history(history_key)
         user_content = user_prompt_final
 
         if message.photo:
@@ -3350,7 +3456,11 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
             return
         api_started_at = time.monotonic()
         first_content_logged = False
-        print(f"[AI Timing] api_request_started user={user_id} group={is_group} mode={active_mode} model={str(active_model.get('modelName', ''))[:80]}")
+        print(
+            f"[AI Timing] api_request_started user={user_id} group={is_group} mode={active_mode} "
+            f"model={str(active_model.get('modelName', ''))[:80]} "
+            f"connect_timeout={API_CONNECT_TIMEOUT_SECONDS}s read_timeout={API_TIMEOUT_SECONDS}s"
+        )
         if native_responses_mode:
             responses_payload = {
                 "model": active_model.get("modelName", "").strip(),
@@ -3361,15 +3471,15 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
                 "max_output_tokens": 4096,
                 "store": False,
             }
-            res = http_session.post(
+            res = get_api_http_session().post(
                 get_responses_endpoint(base_url), headers=headers,
-                json=responses_payload, timeout=(45, API_TIMEOUT_SECONDS), stream=False
+                json=responses_payload, timeout=(API_CONNECT_TIMEOUT_SECONDS, API_TIMEOUT_SECONDS), stream=False
             )
             print(f"[AI Timing] response_received user={user_id} mode={active_mode} elapsed={time.monotonic()-api_started_at:.2f}s streaming=off")
         else:
-            res = http_session.post(
+            res = get_api_http_session().post(
                 endpoint, headers=headers, json=payload,
-                timeout=(45, API_TIMEOUT_SECONDS), stream=bool(payload.get("stream", True))
+                timeout=(API_CONNECT_TIMEOUT_SECONDS, API_TIMEOUT_SECONDS), stream=bool(payload.get("stream", True))
             )
             print(f"[AI Timing] response_headers user={user_id} mode={active_mode} elapsed={time.monotonic()-api_started_at:.2f}s content_type={res.headers.get('Content-Type', '')[:80]}")
         res.encoding = 'utf-8'
@@ -3468,7 +3578,10 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
                     clean_b = base_url.rstrip("/")
                     retry_endpoint = f"{clean_b}/v1/chat/completions"
 
-                retry_res = http_session.post(retry_endpoint, headers=headers, json=retry_payload, timeout=API_TIMEOUT_SECONDS)
+                retry_res = get_api_http_session().post(
+                    retry_endpoint, headers=headers, json=retry_payload,
+                    timeout=(API_CONNECT_TIMEOUT_SECONDS, API_TIMEOUT_SECONDS)
+                )
                 if retry_res.status_code == 200:
                     r_data = retry_res.json()
                     r_msg = r_data.get("choices", [{}])[0].get("message", {})
@@ -3527,6 +3640,14 @@ def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_i
     except Exception as e:
         api_response_text = f"❌ Error: {type(e).__name__} - {str(e)[:100]}"
     finally:
+        # Always close streamed responses. If a user cancels while a stream is active,
+        # this releases the HTTP connection back to the per-worker pool for the next turn.
+        for _response in (retry_res, res):
+            try:
+                if _response is not None:
+                    _response.close()
+            except Exception:
+                pass
         _CANCEL_REQS.discard(req_id)
         safe_kv_delete(f"CANCEL_{req_id}")
 
