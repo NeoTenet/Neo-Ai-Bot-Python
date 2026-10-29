@@ -38,6 +38,8 @@ import base64
 import socket
 import threading
 import urllib.parse
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import requests
 from requests.adapters import HTTPAdapter
@@ -59,6 +61,15 @@ _SPONSORS_CACHE_TIME = 0
 _USER_MODES_CACHE = {}
 _USER_LANG_CACHE = {}
 
+# Prevent duplicate activity writes and no-op thread creation during traffic spikes.
+_ACTIVITY_LOCK = threading.Lock()
+_TRACKING_USERS = set()
+
+# Cache getMe because doing a Telegram API round-trip for every group message adds latency.
+_BOT_INFO_CACHE = None
+_BOT_INFO_CACHE_TIME = 0.0
+_BOT_INFO_LOCK = threading.Lock()
+
 # کش‌های سرعت بالای مانیتورینگ ادمین
 _ALL_USERS_CACHE = None
 _ALL_USERS_CACHE_TIME = 0
@@ -76,10 +87,46 @@ _CODE_BLOCK_REGEX = re.compile(r'```([a-zA-Z0-9_+-]*)[^\n]*\r?\n([\s\S]*?)```')
 _CLEAN_WORDS_REGEX = re.compile(r'[^\w\s]')
 
 _ROBOT_PREFIX_REGEX = re.compile(
-    r'^(نئو|نعو|neo|tenet|ربات[:،,]|روبات[:،,]|بات[:،,]|ربات\s+|روبات\s+)[\s:,،\n]*(.*)$',
+    r'^(نئو|نعو|neo|tenet|تننت|ربات|روبات|بات)(?=$|[\s:،,\-–—.!?؟])'
+    r'[\s:،,\-–—.!?؟]*(.*)$',
     flags=re.IGNORECASE | re.DOTALL
 )
-_ROBOT_EXACT_CALLS = {'ربات', 'روبات', 'بات', 'نئو', 'نعو', 'neo', 'tenet'}
+_ROBOT_EXACT_CALLS = {'ربات', 'روبات', 'بات', 'نئو', 'نعو', 'neo', 'tenet', 'تننت'}
+
+
+def _strip_bot_mention(text, bot_username):
+    """Return (mention_found, text_without_our_bot_mention)."""
+    raw = str(text or '')
+    username = str(bot_username or '').strip().lstrip('@')
+    if not username:
+        return False, raw.strip()
+    pattern = re.compile(r'(?<![\w])@' + re.escape(username) + r'(?![\w])', re.IGNORECASE)
+    found = bool(pattern.search(raw))
+    return found, pattern.sub(' ', raw).strip()
+
+
+def extract_group_invocation(text, bot_username=''):
+    """Recognize explicit group calls by Persian/English prefix or bot @mention.
+
+    Examples: ``نئو سلام``, ``نعو - سلام``, ``neo-hello``, ``Neo: hello``,
+    ``ربات سلام``, ``بات سلام`` and ``hello @botname``.
+    Returns (is_invoked, prompt). The empty prompt means a bare bot call.
+    """
+    raw = str(text or '').strip()
+    mentioned, without_mention = _strip_bot_mention(raw, bot_username)
+
+    candidate = without_mention if mentioned else raw
+    match = _ROBOT_PREFIX_REGEX.match(candidate)
+    if match:
+        return True, match.group(2).strip()
+
+    exact = re.sub(r'[\s:،,\-–—.!?؟]+$', '', candidate).strip().lower()
+    if exact in _ROBOT_EXACT_CALLS:
+        return True, ''
+
+    if mentioned:
+        return True, candidate.strip()
+    return False, raw
 
 def is_casual_greeting(text):
     if not text:
@@ -308,7 +355,80 @@ ADMIN_ID = str(os.getenv("ADMIN_ID", "1033000000"))
 UPSTASH_URL = os.getenv("UPSTASH_URL", "https://precious-chimpupstash.io")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "gQAAAAAAA0eEEeeeeeee")
 
-bot = telebot.TeleBot(BOT_TOKEN or "0:REPLACE_WITH_BOT_TOKEN", parse_mode=None)
+def _env_int(name, default, minimum, maximum):
+    """Read a bounded integer setting without letting a bad environment value stop startup."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+# Keep Telegram update dispatch responsive, especially when users send many messages at once.
+TELEGRAM_HANDLER_THREADS = _env_int("BOT_HANDLER_THREADS", 32, 4, 64)
+AI_JOB_WORKERS = _env_int("AI_JOB_WORKERS", 8, 2, 32)
+AI_JOB_QUEUE_LIMIT = _env_int("AI_JOB_QUEUE_LIMIT", 96, 8, 512)
+CALLBACK_WORKERS = _env_int("BOT_CALLBACK_WORKERS", 12, 2, 32)
+CALLBACK_QUEUE_LIMIT = _env_int("BOT_CALLBACK_QUEUE_LIMIT", 128, 8, 512)
+
+bot = telebot.TeleBot(
+    BOT_TOKEN or "0:REPLACE_WITH_BOT_TOKEN",
+    parse_mode=None,
+    threaded=True,
+    num_threads=TELEGRAM_HANDLER_THREADS,
+)
+
+# Callbacks get their own worker pool, so slow AI/message handlers cannot occupy all
+# callback-processing threads. Both queues are bounded to protect memory under overload.
+_AI_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS, thread_name_prefix="neo-ai-job")
+_AI_JOB_SLOTS = threading.BoundedSemaphore(AI_JOB_WORKERS + AI_JOB_QUEUE_LIMIT)
+_CALLBACK_EXECUTOR = ThreadPoolExecutor(max_workers=CALLBACK_WORKERS, thread_name_prefix="neo-callback")
+_CALLBACK_SLOTS = threading.BoundedSemaphore(CALLBACK_WORKERS + CALLBACK_QUEUE_LIMIT)
+
+
+def _submit_bounded(executor, slots, target, *args, **kwargs):
+    """Submit a task only when there is capacity; return False rather than spawning unlimited threads."""
+    if not slots.acquire(blocking=False):
+        return False
+    try:
+        future = executor.submit(target, *args, **kwargs)
+    except Exception:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _future: slots.release())
+    return True
+
+
+def get_bot_info_cached(force_refresh=False, max_age_seconds=600):
+    """Thread-safe cache for Telegram getMe data; refresh at most every 10 minutes."""
+    global _BOT_INFO_CACHE, _BOT_INFO_CACHE_TIME
+    now = time.monotonic()
+    if not force_refresh and _BOT_INFO_CACHE is not None and (now - _BOT_INFO_CACHE_TIME) < max_age_seconds:
+        return _BOT_INFO_CACHE
+    with _BOT_INFO_LOCK:
+        now = time.monotonic()
+        if not force_refresh and _BOT_INFO_CACHE is not None and (now - _BOT_INFO_CACHE_TIME) < max_age_seconds:
+            return _BOT_INFO_CACHE
+        try:
+            info = bot.get_me()
+            _BOT_INFO_CACHE = info
+            _BOT_INFO_CACHE_TIME = time.monotonic()
+            return info
+        except Exception:
+            # Normal message handling can fall back to the cache, but an explicit
+            # health check must report a fresh API failure rather than a cached success.
+            if _BOT_INFO_CACHE is not None and not force_refresh:
+                return _BOT_INFO_CACHE
+            raise
+
+
+def _notify_job_queue_full(chat_id, thread_id=None):
+    message = "⚠️ تعداد درخواست‌های هم‌زمان زیاد است. لطفاً کمی بعد دوباره تلاش کن."
+    kwargs = {"message_thread_id": thread_id} if thread_id else {}
+    try:
+        bot.send_message(chat_id, message, **kwargs)
+    except Exception as exc:
+        print(f"[Overload Notice Error]: {exc}")
 
 # ==========================================
 # 🌐 تنظیم سوکت شبکه با پکت‌های زنده
@@ -795,19 +915,28 @@ def mark_user_unreachable(user_id, error):
 def track_user_activity(user_id, first_name="", username=""):
     now = time.time()
     u_str = str(user_id)
-    need_sadd = u_str not in _KNOWN_USERS_CACHE
-    need_active = (now - _LAST_ACTIVE_CACHE.get(u_str, 0)) > 120
+
+    # Only one tracking job per user at a time. Normal consecutive messages do not
+    # need a background thread or Redis writes until the 120-second activity interval expires.
+    with _ACTIVITY_LOCK:
+        need_sadd = u_str not in _KNOWN_USERS_CACHE
+        need_active = (now - _LAST_ACTIVE_CACHE.get(u_str, 0)) > 120
+        if not (need_sadd or need_active) or u_str in _TRACKING_USERS:
+            return
+        _TRACKING_USERS.add(u_str)
 
     def _worker():
         try:
             if need_sadd:
                 upstash_command(["SADD", "BOT_USERS_SET", u_str])
-                _KNOWN_USERS_CACHE.add(u_str)
+                with _ACTIVITY_LOCK:
+                    _KNOWN_USERS_CACHE.add(u_str)
 
             if need_active or need_sadd:
                 safe_kv_put(f"LAST_ACTIVE_{u_str}", str(int(now * 1000)))
-                _LAST_ACTIVE_CACHE[u_str] = now
-                # If the user has returned and sent a message, clear any old unreachable marker.
+                with _ACTIVITY_LOCK:
+                    _LAST_ACTIVE_CACHE[u_str] = now
+                # If the user returned, clear any old unreachable marker.
                 upstash_command(["SREM", "BOT_UNREACHABLE_USERS_SET", u_str])
 
                 existing_info_raw = safe_kv_get(f"USER_INFO_{u_str}")
@@ -817,13 +946,13 @@ def track_user_activity(user_id, first_name="", username=""):
                         info = json.loads(existing_info_raw)
                     except Exception:
                         pass
-                
+
                 info["id"] = u_str
                 if first_name:
                     info["name"] = first_name
                 elif "name" not in info:
                     info["name"] = "کاربر"
-                
+
                 info["username"] = f"@{username}" if username else (info.get("username") or "ندارد")
                 if "joined" not in info:
                     info["joined"] = get_jalali_date()
@@ -831,8 +960,11 @@ def track_user_activity(user_id, first_name="", username=""):
                 safe_kv_put(f"USER_INFO_{u_str}", info)
         except Exception as e:
             print(f"[Track User Error]: {e}")
+        finally:
+            with _ACTIVITY_LOCK:
+                _TRACKING_USERS.discard(u_str)
 
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, daemon=True, name=f"user-activity-{u_str}").start()
 
 def clear_user_state(user_id):
     keys = [
@@ -886,7 +1018,9 @@ def load_user_sessions(user_id):
     except Exception:
         return []
 
-def save_sessions_limited(user_id, sessions, limit=MAX_SAVED_SESSIONS):
+_ACTIVE_SESSION_NOT_PROVIDED = object()
+
+def save_sessions_limited(user_id, sessions, limit=MAX_SAVED_SESSIONS, active_id=_ACTIVE_SESSION_NOT_PROVIDED):
     """Persist newest-first session metadata and remove history for sessions beyond the cap."""
     cleaned = []
     seen = set()
@@ -901,7 +1035,9 @@ def save_sessions_limited(user_id, sessions, limit=MAX_SAVED_SESSIONS):
         cleaned.append(item)
         seen.add(sid)
     # Keep the current active chat near the top so it is not removed when pruning old records.
-    active_id = str(safe_kv_get(f"ACTIVE_SESSION_{user_id}") or "")
+    if active_id is _ACTIVE_SESSION_NOT_PROVIDED:
+        active_id = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
+    active_id = str(active_id or "")
     if active_id:
         active_pos = next((i for i, item in enumerate(cleaned) if item["id"] == active_id), None)
         if active_pos is not None and active_pos > 0:
@@ -1049,6 +1185,138 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         print(f"[Document Send Error]: {e}")
         return False
 
+def run_admin_self_tests():
+    """Run bounded, non-destructive system checks; never prints secrets or calls paid AI models."""
+    checks = []
+    def record(label, status, detail):
+        checks.append((label, status, str(detail)))
+
+    # Telegram Bot API reachability and bot identity.
+    try:
+        info = get_bot_info_cached(force_refresh=True)
+        record("اتصال Telegram API", "PASS", f"ربات @{getattr(info, 'username', '') or 'بدون‌نام'} پاسخ داد")
+    except Exception as exc:
+        record("اتصال Telegram API", "FAIL", f"{type(exc).__name__}: {str(exc)[:150]}")
+
+    # Upstash REST connectivity.
+    try:
+        pong = upstash_command(["PING"])
+        if str(pong).upper() == "PONG":
+            record("اتصال Upstash Redis", "PASS", "PING / PONG موفق")
+        else:
+            record("اتصال Upstash Redis", "FAIL", f"پاسخ غیرمنتظره: {str(pong)[:100]}")
+    except Exception as exc:
+        record("اتصال Upstash Redis", "FAIL", f"{type(exc).__name__}: {str(exc)[:150]}")
+
+    # Model registries: JSON shape and required record shape only; no provider token is displayed.
+    registry_keys = ["AI_MODELS", "CODE_MODELS", "IMAGE_MODELS", "VIDEO_MODELS"]
+    try:
+        registry_raw = batch_kv_get(registry_keys)
+    except Exception as exc:
+        registry_raw = {}
+        record("خواندن فهرست مدل‌ها", "FAIL", f"{type(exc).__name__}: {str(exc)[:120]}")
+    registry_counts = {}
+    for key in registry_keys:
+        raw = registry_raw.get(key)
+        try:
+            items = json.loads(raw or "[]")
+            if not isinstance(items, list):
+                raise ValueError("ریشه JSON باید فهرست باشد")
+            malformed = sum(1 for item in items if not isinstance(item, dict))
+            registry_counts[key] = len(items)
+            if malformed:
+                record(f"ساختار {key}", "FAIL", f"{malformed} مورد از نوع دیکشنری نیست")
+            elif not items and key == "AI_MODELS":
+                record(f"ساختار {key}", "WARN", "مدل چت ثبت نشده؛ پاسخ‌گویی AI ممکن نیست")
+            elif not items:
+                record(f"ساختار {key}", "WARN", "در این دسته مدلی ثبت نشده است")
+            else:
+                record(f"ساختار {key}", "PASS", f"{len(items)} مدل/رکورد با JSON معتبر")
+        except Exception as exc:
+            registry_counts[key] = 0
+            record(f"ساختار {key}", "FAIL", f"JSON نامعتبر: {str(exc)[:100]}")
+
+    # Verify Telegram handlers are registered.
+    try:
+        callback_handlers = getattr(bot, "callback_query_handlers", [])
+        message_handlers = getattr(bot, "message_handlers", [])
+        callback_ok = bool(callback_handlers)
+        message_ok = bool(message_handlers)
+        record("ثبت هندلر دکمه‌های شیشه‌ای", "PASS" if callback_ok else "FAIL", f"{len(callback_handlers)} هندلر callback")
+        record("ثبت هندلر پیام‌ها", "PASS" if message_ok else "FAIL", f"{len(message_handlers)} هندلر پیام")
+    except Exception as exc:
+        record("ثبت هندلرها", "FAIL", f"{type(exc).__name__}: {str(exc)[:100]}")
+
+    # Test the very same group-call parser used by the message handler.
+    try:
+        try:
+            test_username = getattr(get_bot_info_cached(), "username", "") or "NeoTenetBot"
+        except Exception:
+            test_username = "NeoTenetBot"
+        samples = [
+            ("نئو سلام", "سلام"),
+            ("نعو - سلام", "سلام"),
+            ("neo-hello", "hello"),
+            ("Neo: hello", "hello"),
+            ("ربات سلام", "سلام"),
+            ("بات سلام", "سلام"),
+            (f"@{test_username} سلام", "سلام"),
+        ]
+        failed_samples = []
+        for sample, expected in samples:
+            invoked, prompt = extract_group_invocation(sample, test_username)
+            if not invoked or prompt.strip().lower() != expected.lower():
+                failed_samples.append(sample)
+        record("تشخیص فراخوانی گروه/منشن", "PASS" if not failed_samples else "FAIL",
+               "۷ نمونه موفق" if not failed_samples else "نمونه ناموفق: " + ", ".join(failed_samples))
+    except Exception as exc:
+        record("تشخیص فراخوانی گروه/منشن", "FAIL", f"{type(exc).__name__}: {str(exc)[:100]}")
+
+    # Controlled burst test: enqueue harmless work directly into each worker pool.
+    # These are not AI requests and do not use external services or credits.
+    for label, executor, worker_count in (
+        ("صف کارهای AI/عکس/ویدیو", _AI_JOB_EXECUTOR, AI_JOB_WORKERS),
+        ("صف callback", _CALLBACK_EXECUTOR, CALLBACK_WORKERS),
+    ):
+        try:
+            probe_count = min(24, max(4, int(worker_count) * 2))
+            futures = [executor.submit(lambda value=index: value * value) for index in range(probe_count)]
+            results = [future.result(timeout=5) for future in futures]
+            expected = [index * index for index in range(probe_count)]
+            valid = results == expected
+            record(label, "PASS" if valid else "FAIL",
+                   f"{probe_count} کار سبک صف شد و {'کامل' if valid else 'ناقص'} اجرا شد؛ بدون درخواست AI واقعی")
+        except Exception as exc:
+            record(label, "FAIL", f"{type(exc).__name__}: {str(exc)[:120]}")
+
+    # Capacity snapshot, not a performance guarantee.
+    try:
+        ai_waiting = getattr(getattr(_AI_JOB_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
+        callback_waiting = getattr(getattr(_CALLBACK_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
+        record("ظرفیت پردازش (نمای لحظه‌ای)", "INFO",
+               f"Handler={TELEGRAM_HANDLER_THREADS} | Callback={CALLBACK_WORKERS}+{CALLBACK_QUEUE_LIMIT} | "
+               f"AI={AI_JOB_WORKERS}+{AI_JOB_QUEUE_LIMIT} | صف فعلی callback={callback_waiting} و AI={ai_waiting}")
+    except Exception as exc:
+        record("ظرفیت پردازش", "WARN", f"قابل خواندن نیست: {type(exc).__name__}")
+
+    passed = sum(1 for _, status, _ in checks if status == "PASS")
+    failed = sum(1 for _, status, _ in checks if status == "FAIL")
+    warnings = sum(1 for _, status, _ in checks if status == "WARN")
+    lines = [
+        "🧪 گزارش تست سلامت ربات Neo AI",
+        f"نتیجه: ✅ {passed} موفق | ❌ {failed} خطا | ⚠️ {warnings} هشدار",
+        "",
+    ]
+    icons = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️", "INFO": "ℹ️"}
+    for label, status, detail in checks:
+        lines.append(f"{icons.get(status, 'ℹ️')} {label}: {detail}")
+    lines.extend([
+        "",
+        "محدودیت تست: برای جلوگیری از مصرف اعتبار، از هر مدل هوش مصنوعی درخواست واقعی ارسال نمی‌شود؛ این گزارش اتصال‌ها، ساختار مدل‌ها، هندلرها، فراخوانی گروه و صف‌های داخلی را بررسی می‌کند.",
+    ])
+    return "\n".join(lines), {"passed": passed, "failed": failed, "warnings": warnings}
+
+
 # ==========================================
 # ۱. رابط کاربری ۳ حالته و تفکیک‌شده دو زبانه
 # ==========================================
@@ -1193,9 +1461,23 @@ def refresh_main_menu_banner(chat_id, user_id, message_id=None):
         return False
 
 
-def send_main_menu(chat_id, user_id):
+def send_main_menu(chat_id, user_id, message_id=None):
     current_mode = get_user_current_mode(user_id)
     welcome_text = build_main_menu_welcome_text(user_id, current_mode)
+    if message_id:
+        try:
+            bot.edit_message_text(
+                welcome_text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_markup(user_id, current_mode),
+            )
+            safe_kv_put(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(message_id))
+            return
+        except Exception:
+            # Fall back to a new menu if the clicked message cannot be edited.
+            pass
     # Telegram cannot attach a ReplyKeyboardMarkup and an InlineKeyboardMarkup to one message.
     # Send them as two messages: persistent bottom buttons + the existing inline menu.
     bot.send_message(
@@ -1241,8 +1523,14 @@ def build_sponsor_markup(user_id, unjoined_channels):
     return markup
 
 def send_history_menu(chat_id, user_id, message_id=None):
-    sessions = load_user_sessions(user_id)
-    active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
+    # Read the two history keys in a single Redis round-trip.
+    history_values = batch_kv_get([f"SESSIONS_{user_id}", f"ACTIVE_SESSION_{user_id}"])
+    try:
+        raw_sessions = json.loads(history_values.get(f"SESSIONS_{user_id}") or "[]")
+        sessions = [item for item in raw_sessions if isinstance(item, dict) and item.get("id")] if isinstance(raw_sessions, list) else []
+    except Exception:
+        sessions = []
+    active_sess = history_values.get(f"ACTIVE_SESSION_{user_id}")
     if not sessions:
         # A first-time user should see the default chat immediately; no manual add is needed.
         get_or_create_active_session(user_id)
@@ -1261,7 +1549,7 @@ def send_history_menu(chat_id, user_id, message_id=None):
         return
 
     markup = types.InlineKeyboardMarkup()
-    sessions = save_sessions_limited(user_id, sessions)
+    sessions = save_sessions_limited(user_id, sessions, active_id=active_sess)
     for s in sessions[:MAX_SAVED_SESSIONS]:
         sid = s.get("id")
         is_cur = "🟢 " if str(sid) == str(active_sess) else "💬 "
@@ -1305,12 +1593,26 @@ def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
     img_models = get_img_models_cached()
     video_models = get_video_models_cached()
 
-    cur_chat_idx = int(safe_kv_get(f"USER_MODEL_{target_key_id}") or "0")
-    cur_code_idx = int(safe_kv_get(f"USER_CODE_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{target_key_id}") or "0")
+    state_keys = [
+        f"USER_MODEL_{target_key_id}",
+        f"USER_CODE_MODEL_{target_key_id}",
+        f"USER_IMG_MODEL_{target_key_id}",
+        f"USER_VIDEO_MODEL_{target_key_id}",
+    ]
+    state_values = batch_kv_get(state_keys)
+
+    def _safe_index(value, default=0):
+        try:
+            return max(0, int(value if value is not None else default))
+        except (TypeError, ValueError):
+            return default
+
+    cur_chat_idx = _safe_index(state_values.get(state_keys[0]))
+    cur_code_idx = _safe_index(state_values.get(state_keys[1]) or state_values.get(state_keys[0]))
     if code_models and not (0 <= cur_code_idx < len(code_models)):
         cur_code_idx = 0
-    cur_img_idx = int(safe_kv_get(f"USER_IMG_MODEL_{target_key_id}") or "0")
-    cur_video_idx = int(safe_kv_get(f"USER_VIDEO_MODEL_{target_key_id}") or "0")
+    cur_img_idx = _safe_index(state_values.get(state_keys[2]))
+    cur_video_idx = _safe_index(state_values.get(state_keys[3]))
 
     chat_name = chat_models[cur_chat_idx].get("name") if cur_chat_idx < len(chat_models) else "تعریف نشده"
     code_name = code_models[cur_code_idx].get("name") if cur_code_idx < len(code_models) else "تعریف نشده"
@@ -1830,7 +2132,10 @@ def get_admin_panel_markup():
         types.InlineKeyboardButton("🎨 افزودن مدل عکس", callback_data="admin_add_img_model", style="success"),
         types.InlineKeyboardButton("🎬 افزودن مدل ویدیو", callback_data="admin_add_video_model", style="success")
     )
-    markup.add(types.InlineKeyboardButton("📘 راهنمای تنظیم مدل‌ها", callback_data="admin_setup_guide", style="primary"))
+    markup.add(
+        types.InlineKeyboardButton("🧪 تست سلامت و بار ربات", callback_data="admin_self_test", style="success"),
+        types.InlineKeyboardButton("📘 راهنمای تنظیم مدل‌ها", callback_data="admin_setup_guide", style="primary"),
+    )
     markup.add(
         types.InlineKeyboardButton("📢 افزودن اسپانسر", callback_data="admin_add_sponsor", style="primary"),
         types.InlineKeyboardButton("📋 لیست کانال‌های اسپانسر", callback_data="admin_del_sponsor_menu", style="danger")
@@ -2501,12 +2806,9 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         safe_kv_delete(f"CANCEL_{req_id}")
 
     if api_response_text and not api_response_text.startswith("❌"):
-        if is_group:
-            sender_name = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "User")
-            final_text = f"👤 **User:** {sender_name} | {mode_icon} **Model:** {active_model.get('name')}\n\n{clean_text}"
-        else:
-            final_text = clean_text
-
+        # Do not prepend internal user/model metadata to group replies.
+        # The chosen model remains visible in the temporary processing message while running.
+        final_text = clean_text
         send_safe_ai_response(chat_id, status_msg_id, final_text, reply_to, thread_id)
         
         if active_mode == "CODE" and code_files:
@@ -3349,7 +3651,7 @@ def handle_start_command(msg):
     if is_group:
         if not is_group_admin(chat_id, user_id):
             return
-        bot_info = bot.get_me()
+        bot_info = get_bot_info_cached()
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🤖 ورود به پیوی ربات", url=f"https://t.me/{bot_info.username}?start=true", style="primary"))
         bot.reply_to(
@@ -3568,11 +3870,11 @@ def handle_all_messages(msg):
     if (not is_group and safe_kv_get(f"VIDEO_PROMPT_AWAITING_{user_id}") == "true"
             and command_text and not command_text.startswith("/")):
         safe_kv_delete(f"VIDEO_PROMPT_AWAITING_{user_id}")
-        threading.Thread(
-            target=worker_video_process,
-            args=(chat_id, user_id, command_text[:2000], target_key_id, thread_id),
-            daemon=True,
-        ).start()
+        if not _submit_bounded(
+            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
+            chat_id, user_id, command_text[:2000], target_key_id, thread_id,
+        ):
+            _notify_job_queue_full(chat_id, thread_id)
         return
 
     if command_lower.startswith("/video") and not is_group:
@@ -3581,7 +3883,11 @@ def handle_all_messages(msg):
         _USER_MODES_CACHE[target_key_id] = "VIDEO"
         safe_kv_put(f"BOT_MODE_{target_key_id}", "VIDEO")
         if prompt:
-            threading.Thread(target=worker_video_process, args=(chat_id, user_id, prompt, target_key_id, thread_id), daemon=True).start()
+            if not _submit_bounded(
+                _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
+                chat_id, user_id, prompt, target_key_id, thread_id,
+            ):
+                _notify_job_queue_full(chat_id, thread_id)
         else:
             bot.send_message(chat_id, "🎬 حالت ساخت ویدیو فعال شد. حالا توضیح ویدیوی مورد نظرت را ارسال کن؛ برای انتخاب مدل از «انتخاب مدل هوش مصنوعی» استفاده کن.", message_thread_id=thread_id)
         return
@@ -3600,7 +3906,7 @@ def handle_all_messages(msg):
 
     target_reply_id = msg.message_id
     if is_group:
-        bot_info = bot.get_me()
+        bot_info = get_bot_info_cached()
         bot_id = str(bot_info.id)
         bot_username = (bot_info.username or "").lower()
         clean_text_raw = text.strip()
@@ -3761,29 +4067,20 @@ def handle_all_messages(msg):
         if safe_kv_get(f"GROUP_MUTED_{chat_id}") == "true":
             return
 
-        is_reply_to_bot = msg.reply_to_message and str(msg.reply_to_message.from_user.id) == bot_id
-        is_reply_to_other_human = msg.reply_to_message and str(msg.reply_to_message.from_user.id) != bot_id
+        replied_from_user = getattr(getattr(msg, 'reply_to_message', None), 'from_user', None)
+        is_reply_to_bot = bool(replied_from_user and str(replied_from_user.id) == bot_id)
+        is_reply_to_other_human = bool(replied_from_user and str(replied_from_user.id) != bot_id)
 
-        if is_reply_to_other_human:
-            has_bot_mention = f"@{bot_username}" in lower_text
-            # Replies to a human may still invoke the bot with any supported prefix.
-            has_unique_call = bool(re.match(
-                r'^(?:نئو|نعو|neo|tenet|ربات|روبات|بات)\b[\s:,،\n]*',
-                text.strip(), flags=re.IGNORECASE
-            ))
-            if not has_bot_mention and not has_unique_call:
-                return
-
-        robot_match = _ROBOT_PREFIX_REGEX.match(text.strip())
-        is_exact_robot_call = text.strip().lower() in _ROBOT_EXACT_CALLS
-
-        if not is_reply_to_bot and not robot_match and not is_exact_robot_call:
+        invoked, extracted_prompt = extract_group_invocation(text, bot_username)
+        if is_reply_to_other_human and not invoked:
+            return
+        if not is_reply_to_bot and not invoked:
             return
 
-        if robot_match:
-            text = robot_match.group(2).strip()
-        elif is_exact_robot_call:
-            text = "سلام! در خدمتم، چطور می‌تونم کمکت کنم؟" if get_user_lang(user_id) == "fa" else "Hello! How can I help you today?"
+        if invoked:
+            text = extracted_prompt.strip()
+            if not text:
+                text = "سلام! در خدمتم، چطور می‌تونم کمکت کنم؟" if get_user_lang(user_id) == "fa" else "Hello! How can I help you today?"
 
         if msg.reply_to_message and str(msg.reply_to_message.from_user.id) != bot_id:
             target_user = msg.reply_to_message.from_user
@@ -3854,7 +4151,11 @@ def handle_all_messages(msg):
     
     active_mode = get_user_current_mode(target_key_id)
     if active_mode == "VIDEO" and not has_photo_attached and text.strip():
-        threading.Thread(target=worker_video_process, args=(chat_id, user_id, text.strip(), target_key_id, thread_id), daemon=True).start()
+        if not _submit_bounded(
+            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
+            chat_id, user_id, text.strip(), target_key_id, thread_id,
+        ):
+            _notify_job_queue_full(chat_id, thread_id)
         return
 
     try:
@@ -3901,7 +4202,11 @@ def handle_all_messages(msg):
         if not is_group:
             _USER_MODES_CACHE[target_key_id] = "CODE"
             safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
-        threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE"), daemon=True).start()
+        if not _submit_bounded(
+            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_ai_process,
+            chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE",
+        ):
+            _notify_job_queue_full(chat_id, thread_id)
         return
 
     # ۲. ساخت تصویر یا ویرایش عکسِ پیوست‌شده با همان مدل تصویری انتخاب‌شده
@@ -3911,27 +4216,34 @@ def handle_all_messages(msg):
     ))
     if has_photo_attached and (active_mode == "IMAGE" or image_edit_intent):
         img_prompt_to_use = text.strip() or "عکس ورودی را با حفظ جزئیات اصلی ویرایش کن."
-        threading.Thread(
-            target=worker_image_process,
-            args=(chat_id, user_id, img_prompt_to_use, target_key_id, thread_id, photo_source_for_image),
-            daemon=True,
-        ).start()
+        if not _submit_bounded(
+            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_image_process,
+            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id, photo_source_for_image,
+        ):
+            _notify_job_queue_full(chat_id, thread_id)
         return
 
     if (active_mode == "IMAGE" or is_img_prompt) and not has_photo_attached:
         img_prompt_to_use = clean_img_prompt if is_img_prompt else text
-        threading.Thread(target=worker_image_process, args=(chat_id, user_id, img_prompt_to_use, target_key_id, thread_id), daemon=True).start()
+        if not _submit_bounded(
+            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_image_process,
+            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id,
+        ):
+            _notify_job_queue_full(chat_id, thread_id)
         return
 
     # ۳. مکالمه و پرسش و پاسخ
     current_ai_mode = "CODE" if active_mode == "CODE" else "CHAT"
-    threading.Thread(target=worker_ai_process, args=(chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode), daemon=True).start()
+    if not _submit_bounded(
+        _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_ai_process,
+        chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode,
+    ):
+        _notify_job_queue_full(chat_id, thread_id)
 
 # ==========================================
 # ۶. هندلر دکمه‌های شیشه‌ای
 # ==========================================
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(query):
+def _handle_callbacks_impl(query):
     chat_id = query.message.chat.id
     user_id = str(query.from_user.id)
     data = query.data
@@ -4434,7 +4746,7 @@ def handle_callbacks(query):
 
     elif data == "main_menu":
         if not is_group:
-            send_main_menu(chat_id, user_id)
+            send_main_menu(chat_id, user_id, query.message.message_id)
 
     elif data == "close_menu":
         try:
@@ -4505,7 +4817,7 @@ def handle_callbacks(query):
         bot.send_message(chat_id, _rtlize_guide_text(guide_text), reply_markup=markup)
 
     elif data == "history_menu" and not is_group:
-        send_history_menu(chat_id, user_id)
+        send_history_menu(chat_id, user_id, query.message.message_id)
 
     elif data.startswith("del_single_sess_") and not is_group:
         del_id = data.replace("del_single_sess_", "")
@@ -4541,7 +4853,46 @@ def handle_callbacks(query):
 
     elif data == "admin_panel" and user_id == ADMIN_ID:
         clear_user_state(user_id)
-        bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", parse_mode="Markdown", reply_markup=get_admin_panel_markup())
+        try:
+            bot.edit_message_text(
+                "🛠 **پنل مدیریت ربات**",
+                chat_id=chat_id,
+                message_id=query.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=get_admin_panel_markup(),
+            )
+        except Exception:
+            bot.send_message(chat_id, "🛠 **پنل مدیریت ربات**", parse_mode="Markdown", reply_markup=get_admin_panel_markup())
+
+    elif data == "admin_self_test" and user_id == ADMIN_ID:
+        try:
+            bot.answer_callback_query(query.id)
+        except Exception:
+            pass
+        try:
+            bot.edit_message_text(
+                "🧪 تست سلامت شروع شد؛ اتصال‌ها، ساختار مدل‌ها و مسیر فراخوانی گروه در حال بررسی هستند...",
+                chat_id=chat_id,
+                message_id=query.message.message_id,
+            )
+        except Exception:
+            pass
+        report, summary = run_admin_self_tests()
+        report_markup = types.InlineKeyboardMarkup(row_width=1)
+        report_markup.add(types.InlineKeyboardButton("🔄 اجرای دوباره تست", callback_data="admin_self_test", style="success"))
+        report_markup.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel"))
+        try:
+            bot.edit_message_text(
+                report[:3900],
+                chat_id=chat_id,
+                message_id=query.message.message_id,
+                reply_markup=report_markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            bot.send_message(chat_id, report[:3900], reply_markup=report_markup, disable_web_page_preview=True)
+        print(f"[Admin Self Test] passed={summary['passed']} failed={summary['failed']} warnings={summary['warnings']}")
+        return
 
     elif data == "admin_setup_guide" and user_id == ADMIN_ID:
         try:
@@ -4746,6 +5097,53 @@ def handle_callbacks(query):
             safe_kv_put("SPONSOR_CHANNELS", channels)
             invalidate_sponsors_cache()
         send_admin_sponsor_list(chat_id, query.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(query):
+    """Dispatch inline-button callbacks away from the general Telegram update pool."""
+    try:
+        accepted = _submit_bounded(
+            _CALLBACK_EXECUTOR, _CALLBACK_SLOTS, _process_callback_query_safely, query
+        )
+    except Exception as exc:
+        print(f"[Callback Dispatch Error]: {exc}")
+        accepted = False
+
+    if not accepted:
+        # Acknowledge overload so Telegram does not leave the button spinner running forever.
+        try:
+            bot.answer_callback_query(
+                query.id,
+                "ربات در حال پردازش درخواست‌های زیادی است؛ لطفاً دوباره تلاش کن.",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        message = getattr(query, "message", None)
+        if message is not None:
+            _notify_job_queue_full(message.chat.id, getattr(message, "message_thread_id", None))
+
+
+def _process_callback_query_safely(query):
+    try:
+        _handle_callbacks_impl(query)
+    except Exception as exc:
+        print(f"[Callback Handler Error] data={getattr(query, 'data', None)!r}: {exc}")
+        traceback.print_exc()
+        try:
+            bot.answer_callback_query(
+                query.id,
+                "در اجرای این گزینه خطایی رخ داد. لطفاً دوباره تلاش کن.",
+                show_alert=True,
+            )
+        except Exception:
+            message = getattr(query, "message", None)
+            if message is not None:
+                try:
+                    bot.send_message(message.chat.id, "⚠️ اجرای این گزینه با خطا روبه‌رو شد؛ دوباره تلاش کن.")
+                except Exception:
+                    pass
+
 
 # ==========================================
 # ۷. هندلر مراحل پنل مدیریت و ویرایشگر مدل‌ها
@@ -5125,6 +5523,8 @@ if __name__ == "__main__":
     print("🤖 Neo-AI-Bot (Ultra-Fast Tech & Model Editor Engine) Started")
     print("⚡ Connected to Upstash Redis REST Database")
     print("⏱️ Max Timeout: 35 Minutes | Instant UI Checkmarks Active")
+    print(f"🧵 Telegram handlers: {TELEGRAM_HANDLER_THREADS} | Callback workers: {CALLBACK_WORKERS}")
+    print(f"⚙️ AI workers: {AI_JOB_WORKERS} | Pending job limit: {AI_JOB_QUEUE_LIMIT}")
     print("🚀 Instant /start Enabled (< 0.2s)")
     print("🌐 Bilingual Support Active (FA / EN)")
     print("🛠 Full Model Editing & Vision Toggling Enabled")
