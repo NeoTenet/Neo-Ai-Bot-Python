@@ -8,7 +8,7 @@ Features:
 - Ultra-Fast Cache Cleaning: Instant RAM and Redis Temp Key Purge under 0.1s
 - Native provider web search: uses only web-search tools exposed by the connected model API
 - Provider-returned citations and source links are shown when the API supplies them
-- Live Thinking Seconds Counter: Smooth 1.5s countdown during processing
+- Stable processing status text without repeated countdown edits
 - Full Admin User CRM: Search by Numeric ID, View Profiles, One-Click Ban/Unban, Kick, DM & Manual Add
 - Group Moderation: Bot Mute (/bot سکوت & /bot صحبت), Group Lock/Unlock (/lock & /unlock), User Mute/Ban/Del
 - Dedicated Code Model Selector: Chat, Coding, and Image models are completely independent in groups & PV
@@ -18,12 +18,14 @@ Features:
 - Separate Video Model Manager with job polling and downloadable output handling
 - Independent standalone search engine removed; video tools retained
 - Strict Thought Filter: Strips <think> and internal monologues completely with safe reasoning fallback
-Timeout: 35 Minutes (2100s)
+Timeout: 60 Minutes (3600s)
 Developer Channel: T.me/Neotenet
 """
 
 import os
 import io
+import ast
+import inspect
 import re
 import json
 import time
@@ -70,6 +72,44 @@ _BOT_INFO_CACHE = None
 _BOT_INFO_CACHE_TIME = 0.0
 _BOT_INFO_LOCK = threading.Lock()
 
+# Short-lived flags prevent repeated Redis round-trips on every group message.
+_STATE_FLAG_CACHE = {}
+_STATE_FLAG_LOCK = threading.Lock()
+_STATE_FLAG_TTL = 30.0
+
+# Cache successful sponsor checks briefly; re-check non-members immediately when they press Verify.
+_SPONSOR_JOIN_VERIFIED_CACHE = {}
+_SPONSOR_JOIN_VERIFIED_LOCK = threading.Lock()
+_SPONSOR_JOIN_VERIFIED_TTL = 60.0
+
+# Menu callbacks update local state immediately and persist it in a single background worker.
+_MODEL_SELECTION_CACHE = {}
+_MODEL_SELECTION_CACHE_LOCK = threading.Lock()
+_MODEL_SELECTION_CACHE_TTL = 300.0
+_SELECTED_MODEL_DISPLAY_CACHE = {}
+_SELECTED_MODEL_DISPLAY_LOCK = threading.Lock()
+_SELECTED_MODEL_DISPLAY_TTL = 120.0
+_MAIN_MENU_MESSAGE_ID_CACHE = {}
+_MAIN_MENU_MESSAGE_ID_LOCK = threading.Lock()
+
+# Short TTL caches prevent serial Redis round-trips before every AI response.
+_ACTIVE_SESSION_CACHE = {}
+_ACTIVE_SESSION_CACHE_LOCK = threading.Lock()
+_ACTIVE_SESSION_CACHE_TTL = 300.0
+_CHAT_HISTORY_CACHE = {}
+_CHAT_HISTORY_CACHE_LOCK = threading.Lock()
+_CHAT_HISTORY_CACHE_TTL = 300.0
+_CHAT_HISTORY_CACHE_MAX = 2048
+_TEMP_STATE_CACHE = {}
+_TEMP_STATE_CACHE_LOCK = threading.Lock()
+_TEMP_STATE_CACHE_TTL = 45.0
+_TEMP_STATE_CACHE_MAX = 4096
+
+# When the bot is globally disabled, do not send a warning for every group message.
+_INACTIVE_NOTICE_LAST_SENT = {}
+_INACTIVE_NOTICE_LOCK = threading.Lock()
+_INACTIVE_NOTICE_INTERVAL = 60.0
+
 # کش‌های سرعت بالای مانیتورینگ ادمین
 _ALL_USERS_CACHE = None
 _ALL_USERS_CACHE_TIME = 0
@@ -81,10 +121,34 @@ _IMAGE_MODELS_CACHE = None
 _IMAGE_MODELS_CACHE_TIME = 0
 _VIDEO_MODELS_CACHE = None
 _VIDEO_MODELS_CACHE_TIME = 0
+_MODEL_REGISTRY_CACHE_TTL = 120.0
 
 _THINK_TAG_REGEX = re.compile(r'<think>[\s\S]*?</think>', flags=re.IGNORECASE)
 _CODE_BLOCK_REGEX = re.compile(r'```([a-zA-Z0-9_+-]*)[^\n]*\r?\n([\s\S]*?)```')
 _CLEAN_WORDS_REGEX = re.compile(r'[^\w\s]')
+
+
+def _safe_stream_preview(raw_content):
+    """Remove complete and still-open <think> regions before showing partial model output."""
+    raw = str(raw_content or "")
+    tag_re = re.compile(r"</?think\b[^>]*>", flags=re.IGNORECASE)
+    chunks = []
+    pos = 0
+    in_think = False
+    for match in tag_re.finditer(raw):
+        tag = match.group(0).lower()
+        is_close = tag.startswith("</")
+        if not in_think and not is_close:
+            chunks.append(raw[pos:match.start()])
+            in_think = True
+        elif in_think and is_close:
+            in_think = False
+        pos = match.end()
+    if not in_think:
+        chunks.append(raw[pos:])
+    visible = "".join(chunks)
+    visible = re.sub(r"[ \t]{2,}", " ", visible)
+    return visible.strip()
 
 _ROBOT_PREFIX_REGEX = re.compile(
     r'^(نئو|نعو|neo|tenet|تننت|ربات|روبات|بات)(?=$|[\s:،,\-–—.!?؟])'
@@ -364,12 +428,26 @@ def _env_int(name, default, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
-# Keep Telegram update dispatch responsive, especially when users send many messages at once.
-TELEGRAM_HANDLER_THREADS = _env_int("BOT_HANDLER_THREADS", 32, 4, 64)
-AI_JOB_WORKERS = _env_int("AI_JOB_WORKERS", 8, 2, 32)
-AI_JOB_QUEUE_LIMIT = _env_int("AI_JOB_QUEUE_LIMIT", 96, 8, 512)
-CALLBACK_WORKERS = _env_int("BOT_CALLBACK_WORKERS", 12, 2, 32)
-CALLBACK_QUEUE_LIMIT = _env_int("BOT_CALLBACK_QUEUE_LIMIT", 128, 8, 512)
+# Large-waiting-queue profile for a low-resource host. Only queue limits were increased;
+# active worker counts and Telegram handler thread count are intentionally unchanged.
+# Each pool can hold up to 1000 waiting jobs; this absorbs bursts, not 1000 simultaneous completions.
+TELEGRAM_HANDLER_THREADS = _env_int("BOT_HANDLER_THREADS", 40, 4, 64)
+AI_JOB_WORKERS = _env_int("AI_JOB_WORKERS", 10, 2, 32)
+AI_JOB_QUEUE_LIMIT = _env_int("AI_JOB_QUEUE_LIMIT", 1000, 8, 2048)
+GROUP_AI_JOB_WORKERS = _env_int("GROUP_AI_JOB_WORKERS", 6, 1, 12)
+GROUP_AI_JOB_QUEUE_LIMIT = _env_int("GROUP_AI_JOB_QUEUE_LIMIT", 1000, 4, 2048)
+CALLBACK_WORKERS = _env_int("BOT_CALLBACK_WORKERS", 16, 2, 32)
+CALLBACK_QUEUE_LIMIT = _env_int("BOT_CALLBACK_QUEUE_LIMIT", 1000, 8, 2048)
+# Image/video services often have slower jobs and different rate limits. Keep them
+# out of the general chat/code queue so one type of workload cannot monopolize it.
+IMAGE_JOB_WORKERS = _env_int("IMAGE_JOB_WORKERS", 2, 1, 8)
+IMAGE_JOB_QUEUE_LIMIT = _env_int("IMAGE_JOB_QUEUE_LIMIT", 1000, 4, 2048)
+VIDEO_JOB_WORKERS = _env_int("VIDEO_JOB_WORKERS", 1, 1, 4)
+VIDEO_JOB_QUEUE_LIMIT = _env_int("VIDEO_JOB_QUEUE_LIMIT", 1000, 2, 2048)
+API_TIMEOUT_SECONDS = _env_int("API_TIMEOUT_SECONDS", 3600, 60, 7200)
+
+# Keep small settings writes off interactive callback threads; one worker preserves write order.
+_SETTINGS_PERSIST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo-settings-persist")
 
 bot = telebot.TeleBot(
     BOT_TOKEN or "0:REPLACE_WITH_BOT_TOKEN",
@@ -378,12 +456,19 @@ bot = telebot.TeleBot(
     num_threads=TELEGRAM_HANDLER_THREADS,
 )
 
-# Callbacks get their own worker pool, so slow AI/message handlers cannot occupy all
-# callback-processing threads. Both queues are bounded to protect memory under overload.
+# Each executor has a bounded semaphore so excessive submissions are rejected cleanly.
+# Chat/code, group text/code, callbacks, image generation, and video generation each
+# have separate limits. These pools do not create unlimited background threads.
 _AI_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS, thread_name_prefix="neo-ai-job")
 _AI_JOB_SLOTS = threading.BoundedSemaphore(AI_JOB_WORKERS + AI_JOB_QUEUE_LIMIT)
+_GROUP_AI_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=GROUP_AI_JOB_WORKERS, thread_name_prefix="neo-group-ai")
+_GROUP_AI_JOB_SLOTS = threading.BoundedSemaphore(GROUP_AI_JOB_WORKERS + GROUP_AI_JOB_QUEUE_LIMIT)
 _CALLBACK_EXECUTOR = ThreadPoolExecutor(max_workers=CALLBACK_WORKERS, thread_name_prefix="neo-callback")
 _CALLBACK_SLOTS = threading.BoundedSemaphore(CALLBACK_WORKERS + CALLBACK_QUEUE_LIMIT)
+_IMAGE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=IMAGE_JOB_WORKERS, thread_name_prefix="neo-image-job")
+_IMAGE_JOB_SLOTS = threading.BoundedSemaphore(IMAGE_JOB_WORKERS + IMAGE_JOB_QUEUE_LIMIT)
+_VIDEO_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=VIDEO_JOB_WORKERS, thread_name_prefix="neo-video-job")
+_VIDEO_JOB_SLOTS = threading.BoundedSemaphore(VIDEO_JOB_WORKERS + VIDEO_JOB_QUEUE_LIMIT)
 
 
 def _submit_bounded(executor, slots, target, *args, **kwargs):
@@ -422,13 +507,15 @@ def get_bot_info_cached(force_refresh=False, max_age_seconds=600):
             raise
 
 
-def _notify_job_queue_full(chat_id, thread_id=None):
+def _notify_job_queue_full(chat_id, thread_id=None, status_msg=None):
     message = "⚠️ تعداد درخواست‌های هم‌زمان زیاد است. لطفاً کمی بعد دوباره تلاش کن."
+    if _edit_processing_ack(chat_id, status_msg, message):
+        return
     kwargs = {"message_thread_id": thread_id} if thread_id else {}
     try:
         bot.send_message(chat_id, message, **kwargs)
     except Exception as exc:
-        print(f"[Overload Notice Error]: {exc}")
+        print(f"[Overload Notice Error]: {type(exc).__name__}")
 
 # ==========================================
 # 🌐 تنظیم سوکت شبکه با پکت‌های زنده
@@ -497,6 +584,202 @@ def safe_kv_delete(key):
         print(f"[Upstash Del Error {key}]: {e}")
         return False
 
+
+def _history_cache_put(key, history):
+    """Cache only the compact sanitized history representation, never base64 image data."""
+    try:
+        safe_history = json.loads(json.dumps(history if isinstance(history, list) else [], ensure_ascii=False))
+    except Exception:
+        safe_history = []
+    now = time.monotonic()
+    with _CHAT_HISTORY_CACHE_LOCK:
+        _CHAT_HISTORY_CACHE[key] = (now, safe_history)
+        if len(_CHAT_HISTORY_CACHE) > _CHAT_HISTORY_CACHE_MAX:
+            oldest = sorted(_CHAT_HISTORY_CACHE.items(), key=lambda item: item[1][0])
+            for old_key, _ in oldest[:max(1, len(_CHAT_HISTORY_CACHE) - _CHAT_HISTORY_CACHE_MAX)]:
+                _CHAT_HISTORY_CACHE.pop(old_key, None)
+
+
+def _history_cache_delete(key):
+    with _CHAT_HISTORY_CACHE_LOCK:
+        _CHAT_HISTORY_CACHE.pop(key, None)
+
+
+def _load_chat_history(key):
+    now = time.monotonic()
+    with _CHAT_HISTORY_CACHE_LOCK:
+        cached = _CHAT_HISTORY_CACHE.get(key)
+        if cached and now - cached[0] < _CHAT_HISTORY_CACHE_TTL:
+            try:
+                return json.loads(json.dumps(cached[1], ensure_ascii=False))
+            except Exception:
+                _CHAT_HISTORY_CACHE.pop(key, None)
+    raw = safe_kv_get(key)
+    try:
+        history = json.loads(raw or "[]")
+        if not isinstance(history, list):
+            history = []
+    except Exception:
+        history = []
+    _history_cache_put(key, history)
+    return history
+
+
+def _set_active_session_cache(user_id, session_id):
+    with _ACTIVE_SESSION_CACHE_LOCK:
+        if session_id:
+            _ACTIVE_SESSION_CACHE[str(user_id)] = (time.monotonic(), str(session_id))
+        else:
+            _ACTIVE_SESSION_CACHE.pop(str(user_id), None)
+
+
+def _get_active_session_cache(user_id):
+    now = time.monotonic()
+    with _ACTIVE_SESSION_CACHE_LOCK:
+        cached = _ACTIVE_SESSION_CACHE.get(str(user_id))
+        if cached and now - cached[0] < _ACTIVE_SESSION_CACHE_TTL:
+            return cached[1]
+        _ACTIVE_SESSION_CACHE.pop(str(user_id), None)
+    return None
+
+
+def _temp_state_get(key):
+    """Cache transient image-prompt/file-id state so ordinary prompts avoid extra Redis GETs."""
+    now = time.monotonic()
+    with _TEMP_STATE_CACHE_LOCK:
+        cached = _TEMP_STATE_CACHE.get(key)
+        if cached and now - cached[0] < _TEMP_STATE_CACHE_TTL:
+            return cached[1]
+        _TEMP_STATE_CACHE.pop(key, None)
+    value = safe_kv_get(key)
+    with _TEMP_STATE_CACHE_LOCK:
+        _TEMP_STATE_CACHE[key] = (time.monotonic(), value)
+        if len(_TEMP_STATE_CACHE) > _TEMP_STATE_CACHE_MAX:
+            oldest = sorted(_TEMP_STATE_CACHE.items(), key=lambda item: item[1][0])
+            for old_key, _ in oldest[:max(1, len(_TEMP_STATE_CACHE) - _TEMP_STATE_CACHE_MAX)]:
+                _TEMP_STATE_CACHE.pop(old_key, None)
+    return value
+
+
+def _temp_state_put(key, value, expiration_ttl=None):
+    str_value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    with _TEMP_STATE_CACHE_LOCK:
+        _TEMP_STATE_CACHE[key] = (time.monotonic(), str_value)
+    return safe_kv_put(key, str_value, expiration_ttl=expiration_ttl)
+
+
+def _temp_state_delete(key):
+    with _TEMP_STATE_CACHE_LOCK:
+        _TEMP_STATE_CACHE.pop(key, None)
+    return safe_kv_delete(key)
+
+
+def _persist_kv_async(key, value, expiration_ttl=None):
+    """Persist UI settings outside callback workers so menu updates do not wait on Redis."""
+    try:
+        _SETTINGS_PERSIST_EXECUTOR.submit(safe_kv_put, key, value, expiration_ttl)
+        return True
+    except Exception as exc:
+        print(f"[Async Settings Persist Error {key}]: {type(exc).__name__}")
+        return False
+
+
+def _model_selection_get_cached(key):
+    now = time.monotonic()
+    with _MODEL_SELECTION_CACHE_LOCK:
+        cached = _MODEL_SELECTION_CACHE.get(key)
+        if cached and (now - cached[0]) < _MODEL_SELECTION_CACHE_TTL:
+            return cached[1]
+    return None
+
+
+def _model_selection_get_or_load(key, default="0"):
+    """Get a selected index from RAM; query Redis only on a cold cache."""
+    value = _model_selection_get_cached(key)
+    if value is not None:
+        return str(value)
+    value = safe_kv_get(key) or default
+    with _MODEL_SELECTION_CACHE_LOCK:
+        _MODEL_SELECTION_CACHE[key] = (time.monotonic(), str(value))
+    return str(value)
+
+
+def _model_selection_set_cached(key, value, persist=True):
+    value = str(value)
+    with _MODEL_SELECTION_CACHE_LOCK:
+        _MODEL_SELECTION_CACHE[key] = (time.monotonic(), value)
+    if persist:
+        _persist_kv_async(key, value)
+    return value
+
+
+def _send_processing_ack(chat_id, text, thread_id=None, reply_to_message_id=None, reply_markup=None):
+    """Send a quick status message before Redis/API work or queue waiting."""
+    kwargs = {}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    if reply_to_message_id:
+        kwargs["reply_to_message_id"] = reply_to_message_id
+        kwargs["allow_sending_without_reply"] = True
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    try:
+        return bot.send_message(chat_id, text, **kwargs)
+    except Exception as exc:
+        print(f"[Fast Acknowledgement Warning] chat={chat_id}: {type(exc).__name__}")
+        return None
+
+
+def _prepare_ai_job_status(chat_id, user_id, status_msg, thread_id=None, reply_to_message_id=None, received_at=None, is_group=False):
+    """Attach a cancel button before placing a text/code AI task in a possibly busy queue."""
+    request_id = f"{user_id}_{time.time_ns()}"
+    if received_at is not None:
+        print(f"[AI Timing] handler_to_enqueue user={user_id} group={is_group} elapsed={max(0.0, time.monotonic()-received_at):.2f}s")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_req_{request_id}", style="danger"))
+    status_text = "💬 در حال فکر کردن..."
+    if status_msg is not None:
+        _edit_processing_ack(chat_id, status_msg, status_text, reply_markup=markup)
+    else:
+        status_msg = _send_processing_ack(
+            chat_id, status_text, thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id, reply_markup=markup,
+        )
+    return request_id, status_msg, time.monotonic()
+
+
+def _edit_processing_ack(chat_id, status_msg, text, reply_markup=None, parse_mode=None):
+    if status_msg is None:
+        return False
+    try:
+        bot.edit_message_text(
+            text, chat_id=chat_id, message_id=status_msg.message_id,
+            reply_markup=reply_markup, parse_mode=parse_mode,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _delete_processing_ack(chat_id, status_msg):
+    if status_msg is None:
+        return
+    try:
+        bot.delete_message(chat_id, status_msg.message_id)
+    except Exception:
+        pass
+
+
+def _clear_active_history_async(user_id):
+    def _clear():
+        active_session = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
+        if active_session:
+            safe_kv_delete(f"HISTORY_{user_id}_{active_session}")
+    try:
+        _SETTINGS_PERSIST_EXECUTOR.submit(_clear)
+    except Exception as exc:
+        print(f"[Async History Clear Warning] user={user_id}: {type(exc).__name__}")
+
 # ==========================================
 # ⚡ توابع ایمن مدیریت کش‌ها (ضد SyntaxError)
 # ==========================================
@@ -508,12 +791,71 @@ def set_bot_status(is_active):
 def is_bot_globally_active():
     global _BOT_STATUS_CACHE, _BOT_STATUS_TIME
     now = time.time()
-    if _BOT_STATUS_CACHE is not None and (now - _BOT_STATUS_TIME) < 20:
+    if _BOT_STATUS_CACHE is not None and (now - _BOT_STATUS_TIME) < 120:
         return _BOT_STATUS_CACHE
     res = safe_kv_get("BOT_GLOBAL_STATUS") != "off"
     _BOT_STATUS_CACHE = res
     _BOT_STATUS_TIME = now
     return res
+
+
+def _get_cached_state_flag(cache_key, redis_key):
+    """Read a true/false Redis flag with a tiny TTL for high-traffic message paths."""
+    now = time.monotonic()
+    with _STATE_FLAG_LOCK:
+        cached = _STATE_FLAG_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < _STATE_FLAG_TTL:
+            return cached[1]
+    value = str(safe_kv_get(redis_key) or "").lower() == "true"
+    with _STATE_FLAG_LOCK:
+        _STATE_FLAG_CACHE[cache_key] = (time.monotonic(), value)
+    return value
+
+
+def _invalidate_state_flag(cache_key):
+    with _STATE_FLAG_LOCK:
+        _STATE_FLAG_CACHE.pop(cache_key, None)
+
+
+def is_user_banned_cached(user_id):
+    user_id = str(user_id)
+    return _get_cached_state_flag(("banned", user_id), f"BANNED_{user_id}")
+
+
+def is_group_muted_cached(chat_id):
+    chat_id = str(chat_id)
+    return _get_cached_state_flag(("group_muted", chat_id), f"GROUP_MUTED_{chat_id}")
+
+
+def notify_bot_disabled_once(chat_id, thread_id=None):
+    """Rate-limit the disabled notice and swallow transient Telegram network failures."""
+    now = time.monotonic()
+    key = str(chat_id)
+    with _INACTIVE_NOTICE_LOCK:
+        last_sent = _INACTIVE_NOTICE_LAST_SENT.get(key, 0.0)
+        if now - last_sent < _INACTIVE_NOTICE_INTERVAL:
+            return False
+        # Throttle before attempting the API call, including failed sends.
+        _INACTIVE_NOTICE_LAST_SENT[key] = now
+        if len(_INACTIVE_NOTICE_LAST_SENT) > 4096:
+            cutoff = now - (_INACTIVE_NOTICE_INTERVAL * 5)
+            for old_key, old_time in list(_INACTIVE_NOTICE_LAST_SENT.items()):
+                if old_time < cutoff:
+                    _INACTIVE_NOTICE_LAST_SENT.pop(old_key, None)
+    kwargs = {"parse_mode": "Markdown"}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    try:
+        bot.send_message(
+            chat_id,
+            "⚠️ **ربات موقتاً توسط مدیریت خاموش است.**",
+            **kwargs,
+        )
+        return True
+    except Exception as exc:
+        # Avoid logging the exception URL because Telegram URLs may contain the bot token.
+        print(f"[Disabled Notice Delivery Warning] chat={key}: {type(exc).__name__}; Telegram API connection failed or timed out.")
+        return False
 
 def clean_channel_username(raw_ch):
     if not raw_ch:
@@ -527,6 +869,8 @@ def invalidate_sponsors_cache():
     global _SPONSORS_CACHE, _SPONSORS_CACHE_TIME
     _SPONSORS_CACHE = None
     _SPONSORS_CACHE_TIME = 0
+    with _SPONSOR_JOIN_VERIFIED_LOCK:
+        _SPONSOR_JOIN_VERIFIED_CACHE.clear()
 
 def get_sponsor_channels_cached():
     global _SPONSORS_CACHE, _SPONSORS_CACHE_TIME
@@ -550,6 +894,8 @@ def get_sponsor_channels_cached():
 def invalidate_models_cache():
     global _AI_MODELS_CACHE, _AI_MODELS_CACHE_TIME, _CODE_MODELS_CACHE, _CODE_MODELS_CACHE_TIME, _IMAGE_MODELS_CACHE, _IMAGE_MODELS_CACHE_TIME
     global _VIDEO_MODELS_CACHE, _VIDEO_MODELS_CACHE_TIME
+    with _SELECTED_MODEL_DISPLAY_LOCK:
+        _SELECTED_MODEL_DISPLAY_CACHE.clear()
     _AI_MODELS_CACHE = None
     _AI_MODELS_CACHE_TIME = 0
     _CODE_MODELS_CACHE = None
@@ -562,7 +908,7 @@ def invalidate_models_cache():
 def get_ai_models_cached():
     global _AI_MODELS_CACHE, _AI_MODELS_CACHE_TIME
     now = time.time()
-    if _AI_MODELS_CACHE is not None and (now - _AI_MODELS_CACHE_TIME) < 45:
+    if _AI_MODELS_CACHE is not None and (now - _AI_MODELS_CACHE_TIME) < _MODEL_REGISTRY_CACHE_TTL:
         return _AI_MODELS_CACHE
     models = json.loads(safe_kv_get("AI_MODELS") or "[]")
     _AI_MODELS_CACHE = models
@@ -573,7 +919,7 @@ def get_code_models_cached():
     """Dedicated programming-model registry; unlike chat models it is independently editable."""
     global _CODE_MODELS_CACHE, _CODE_MODELS_CACHE_TIME
     now = time.time()
-    if _CODE_MODELS_CACHE is not None and (now - _CODE_MODELS_CACHE_TIME) < 45:
+    if _CODE_MODELS_CACHE is not None and (now - _CODE_MODELS_CACHE_TIME) < _MODEL_REGISTRY_CACHE_TTL:
         return _CODE_MODELS_CACHE
     try:
         raw = safe_kv_get("CODE_MODELS") or "[]"
@@ -588,7 +934,7 @@ def get_code_models_cached():
 def get_img_models_cached():
     global _IMAGE_MODELS_CACHE, _IMAGE_MODELS_CACHE_TIME
     now = time.time()
-    if _IMAGE_MODELS_CACHE is not None and (now - _IMAGE_MODELS_CACHE_TIME) < 45:
+    if _IMAGE_MODELS_CACHE is not None and (now - _IMAGE_MODELS_CACHE_TIME) < _MODEL_REGISTRY_CACHE_TTL:
         return _IMAGE_MODELS_CACHE
     models = json.loads(safe_kv_get("IMAGE_MODELS") or "[]")
     _IMAGE_MODELS_CACHE = models
@@ -598,7 +944,7 @@ def get_img_models_cached():
 def get_video_models_cached():
     global _VIDEO_MODELS_CACHE, _VIDEO_MODELS_CACHE_TIME
     now = time.time()
-    if _VIDEO_MODELS_CACHE is not None and (now - _VIDEO_MODELS_CACHE_TIME) < 45:
+    if _VIDEO_MODELS_CACHE is not None and (now - _VIDEO_MODELS_CACHE_TIME) < _MODEL_REGISTRY_CACHE_TTL:
         return _VIDEO_MODELS_CACHE
     models = json.loads(safe_kv_get("VIDEO_MODELS") or "[]")
     if not isinstance(models, list):
@@ -606,6 +952,34 @@ def get_video_models_cached():
     _VIDEO_MODELS_CACHE = models
     _VIDEO_MODELS_CACHE_TIME = now
     return models
+
+
+def warm_model_registry_cache():
+    """Preload all model registries with one Redis MGET so the first menu opens quickly."""
+    global _AI_MODELS_CACHE, _AI_MODELS_CACHE_TIME
+    global _CODE_MODELS_CACHE, _CODE_MODELS_CACHE_TIME
+    global _IMAGE_MODELS_CACHE, _IMAGE_MODELS_CACHE_TIME
+    global _VIDEO_MODELS_CACHE, _VIDEO_MODELS_CACHE_TIME
+    keys = ("AI_MODELS", "CODE_MODELS", "IMAGE_MODELS", "VIDEO_MODELS")
+    values = batch_kv_get(keys)
+    # Do not cache an apparent empty registry when Upstash is unreachable; otherwise
+    # a transient startup network failure could hide configured models for two minutes.
+    if not any(values.get(key) is not None for key in keys):
+        raise RuntimeError("Upstash model registry warm-up returned no values")
+    parsed = {}
+    for key in keys:
+        raw = values.get(key)
+        try:
+            value = json.loads(raw) if raw else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = []
+        parsed[key] = value if isinstance(value, list) else []
+    now = time.time()
+    _AI_MODELS_CACHE, _AI_MODELS_CACHE_TIME = parsed["AI_MODELS"], now
+    _CODE_MODELS_CACHE, _CODE_MODELS_CACHE_TIME = parsed["CODE_MODELS"], now
+    _IMAGE_MODELS_CACHE, _IMAGE_MODELS_CACHE_TIME = parsed["IMAGE_MODELS"], now
+    _VIDEO_MODELS_CACHE, _VIDEO_MODELS_CACHE_TIME = parsed["VIDEO_MODELS"], now
+    return {key: len(value) for key, value in parsed.items()}
 
 def invalidate_users_cache():
     global _ALL_USERS_CACHE, _ALL_USERS_CACHE_TIME
@@ -989,6 +1363,12 @@ def is_group_admin(chat_id, user_id):
 def check_sponsor_join(user_id):
     if str(user_id) == str(ADMIN_ID):
         return True, []
+    uid = str(user_id)
+    now = time.monotonic()
+    with _SPONSOR_JOIN_VERIFIED_LOCK:
+        checked_at = _SPONSOR_JOIN_VERIFIED_CACHE.get(uid)
+        if checked_at is not None and (now - checked_at) < _SPONSOR_JOIN_VERIFIED_TTL:
+            return True, []
     channels = get_sponsor_channels_cached()
     if not channels:
         return True, []
@@ -1006,6 +1386,17 @@ def check_sponsor_join(user_id):
         except Exception:
             unjoined.append(clean_ch)
 
+    if not unjoined:
+        with _SPONSOR_JOIN_VERIFIED_LOCK:
+            _SPONSOR_JOIN_VERIFIED_CACHE[uid] = time.monotonic()
+            if len(_SPONSOR_JOIN_VERIFIED_CACHE) > 10000:
+                cutoff = time.monotonic() - (_SPONSOR_JOIN_VERIFIED_TTL * 3)
+                for cached_uid, cached_time in list(_SPONSOR_JOIN_VERIFIED_CACHE.items()):
+                    if cached_time < cutoff:
+                        _SPONSOR_JOIN_VERIFIED_CACHE.pop(cached_uid, None)
+    else:
+        with _SPONSOR_JOIN_VERIFIED_LOCK:
+            _SPONSOR_JOIN_VERIFIED_CACHE.pop(uid, None)
     return len(unjoined) == 0, unjoined
 
 MAX_SAVED_SESSIONS = 7
@@ -1057,19 +1448,31 @@ def create_new_session(user_id):
     sessions = load_user_sessions(user_id)
     sessions.insert(0, make_session_record(new_id))
     safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_id)
-    save_sessions_limited(user_id, sessions)
+    save_sessions_limited(user_id, sessions, active_id=new_id)
+    _set_active_session_cache(user_id, new_id)
     return new_id
 
 def get_or_create_active_session(user_id):
+    # Most messages belong to the same active session; avoid re-reading and re-writing
+    # SESSIONS metadata on every prompt. New/switch/delete operations update this cache.
+    cached_id = _get_active_session_cache(user_id)
+    if cached_id:
+        return str(cached_id)
+
     active_id = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
+    if active_id:
+        _set_active_session_cache(user_id, active_id)
+        return str(active_id)
+
     sessions = load_user_sessions(user_id)
-    if not active_id:
+    if sessions:
+        active_id = str(sessions[0]["id"])
+    else:
         active_id = f"sess_{time.time_ns()}"
         sessions.insert(0, make_session_record(active_id))
-        safe_kv_put(f"ACTIVE_SESSION_{user_id}", active_id)
-    elif not any(str(s.get("id")) == str(active_id) for s in sessions):
-        sessions.insert(0, make_session_record(active_id))
-    save_sessions_limited(user_id, sessions)
+    safe_kv_put(f"ACTIVE_SESSION_{user_id}", active_id)
+    save_sessions_limited(user_id, sessions, active_id=active_id)
+    _set_active_session_cache(user_id, active_id)
     return str(active_id)
 
 def update_session_title_if_new(user_id, session_id, first_msg):
@@ -1094,6 +1497,18 @@ def chunk_string(s, size=4000):
     return [s[i:i + size] for i in range(0, len(s), size)]
 
 def send_safe_ai_response(chat_id, message_id, text, reply_to_id=None, thread_id=None):
+    if message_id is None:
+        kwargs = {}
+        if reply_to_id:
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs["allow_sending_without_reply"] = True
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+        try:
+            bot.send_message(chat_id, text[:4000], **kwargs)
+        except Exception as exc:
+            print(f"[AI Final Send Error] chat={chat_id}: {type(exc).__name__}")
+        return
     if len(text) <= 4000:
         try:
             bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown")
@@ -1185,6 +1600,46 @@ def send_code_document_safe(chat_id, byte_data, filename, ext, reply_to_id=None,
         print(f"[Document Send Error]: {e}")
         return False
 
+def _keyboard_callback_values(markup):
+    """Extract callback_data from a Telegram inline markup object."""
+    values = []
+    for row in getattr(markup, "keyboard", []) or []:
+        for button in row or []:
+            callback_data = getattr(button, "callback_data", None)
+            if callback_data is not None:
+                values.append(str(callback_data))
+    return values
+
+
+def _callback_route_rules():
+    """Read dispatcher conditions so the self-test can detect buttons with no route."""
+    exact = set()
+    prefixes = set()
+    source = inspect.getsource(_handle_callbacks_impl)
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "data":
+            for op, comp in zip(node.ops, node.comparators):
+                if isinstance(op, ast.Eq) and isinstance(comp, ast.Constant) and isinstance(comp.value, str):
+                    exact.add(comp.value)
+                elif isinstance(op, ast.In) and isinstance(comp, (ast.List, ast.Tuple, ast.Set)):
+                    exact.update(elt.value for elt in comp.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (isinstance(node.func.value, ast.Name) and node.func.value.id == "data"
+                    and node.func.attr == "startswith" and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                prefixes.add(node.args[0].value)
+        elif isinstance(node, ast.Assign):
+            names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if names.intersection({"group_allowed_actions", "pv_only"}) and isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+                exact.update(elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str))
+    return exact, prefixes
+
+
+def _callback_route_known(callback_data, exact_routes, prefixes):
+    return callback_data in exact_routes or any(callback_data.startswith(prefix) for prefix in prefixes)
+
+
 def run_admin_self_tests():
     """Run bounded, non-destructive system checks; never prints secrets or calls paid AI models."""
     checks = []
@@ -1196,7 +1651,12 @@ def run_admin_self_tests():
         info = get_bot_info_cached(force_refresh=True)
         record("اتصال Telegram API", "PASS", f"ربات @{getattr(info, 'username', '') or 'بدون‌نام'} پاسخ داد")
     except Exception as exc:
-        record("اتصال Telegram API", "FAIL", f"{type(exc).__name__}: {str(exc)[:150]}")
+        # Exception messages may contain the Telegram bot token in a request URL. Never print it.
+        safe_detail = str(exc)
+        if BOT_TOKEN:
+            safe_detail = safe_detail.replace(str(BOT_TOKEN), "[REDACTED_TOKEN]")
+        safe_detail = re.sub(r"(/bot)[^/]+(/)", r"\1[REDACTED]\2", safe_detail)
+        record("اتصال Telegram API", "FAIL", f"{type(exc).__name__}: {safe_detail[:120]}")
 
     # Upstash REST connectivity.
     try:
@@ -1216,6 +1676,7 @@ def run_admin_self_tests():
         registry_raw = {}
         record("خواندن فهرست مدل‌ها", "FAIL", f"{type(exc).__name__}: {str(exc)[:120]}")
     registry_counts = {}
+    registry_lists = {}
     for key in registry_keys:
         raw = registry_raw.get(key)
         try:
@@ -1224,6 +1685,7 @@ def run_admin_self_tests():
                 raise ValueError("ریشه JSON باید فهرست باشد")
             malformed = sum(1 for item in items if not isinstance(item, dict))
             registry_counts[key] = len(items)
+            registry_lists[key] = [item for item in items if isinstance(item, dict)]
             if malformed:
                 record(f"ساختار {key}", "FAIL", f"{malformed} مورد از نوع دیکشنری نیست")
             elif not items and key == "AI_MODELS":
@@ -1234,6 +1696,7 @@ def run_admin_self_tests():
                 record(f"ساختار {key}", "PASS", f"{len(items)} مدل/رکورد با JSON معتبر")
         except Exception as exc:
             registry_counts[key] = 0
+            registry_lists[key] = []
             record(f"ساختار {key}", "FAIL", f"JSON نامعتبر: {str(exc)[:100]}")
 
     # Verify Telegram handlers are registered.
@@ -1255,11 +1718,16 @@ def run_admin_self_tests():
             test_username = "NeoTenetBot"
         samples = [
             ("نئو سلام", "سلام"),
+            ("نئو-سلام", "سلام"),
             ("نعو - سلام", "سلام"),
             ("neo-hello", "hello"),
             ("Neo: hello", "hello"),
+            ("NEO - hello", "hello"),
             ("ربات سلام", "سلام"),
+            ("ربات: سلام", "سلام"),
             ("بات سلام", "سلام"),
+            ("بات، سلام", "سلام"),
+            ("tenet, hi", "hi"),
             (f"@{test_username} سلام", "سلام"),
         ]
         failed_samples = []
@@ -1268,15 +1736,33 @@ def run_admin_self_tests():
             if not invoked or prompt.strip().lower() != expected.lower():
                 failed_samples.append(sample)
         record("تشخیص فراخوانی گروه/منشن", "PASS" if not failed_samples else "FAIL",
-               "۷ نمونه موفق" if not failed_samples else "نمونه ناموفق: " + ", ".join(failed_samples))
+               "۱۲ نمونه موفق" if not failed_samples else "نمونه ناموفق: " + ", ".join(failed_samples))
     except Exception as exc:
         record("تشخیص فراخوانی گروه/منشن", "FAIL", f"{type(exc).__name__}: {str(exc)[:100]}")
+    record("پیش‌نیاز فراخوانی با کلمات ساده در گروه", "INFO",
+           "اگر کلماتی مثل «نئو/ربات» به ربات نمی‌رسند، در BotFather دستور /setprivacy را برای همین ربات روی Disable قرار بده؛ وضعیت Privacy Mode از Bot API قابل بررسی مستقیم نیست.")
+
+    # Safe streaming preview must never expose an unfinished or completed internal <think> block.
+    try:
+        preview_cases = [
+            ("پاسخ عادی", "سلام دنیا", "سلام دنیا"),
+            ("فیلتر فکر کامل", "پاسخ <think>متن داخلی</think> نهایی", "پاسخ نهایی"),
+            ("فیلتر فکر ناقص", "پاسخ قابل نمایش <think>متن داخلی", "پاسخ قابل نمایش"),
+        ]
+        failed_preview = [name for name, raw, expected in preview_cases if _safe_stream_preview(raw) != expected]
+        record("امنیت پیش‌نمایش تدریجی پاسخ گروه", "FAIL" if failed_preview else "PASS",
+               "نمونه ناموفق: " + ", ".join(failed_preview) if failed_preview else "۳ نمونه؛ متن داخلی <think> نمایش داده نمی‌شود")
+    except Exception as exc:
+        record("امنیت پیش‌نمایش تدریجی پاسخ گروه", "FAIL", f"{type(exc).__name__}: {str(exc)[:100]}")
 
     # Controlled burst test: enqueue harmless work directly into each worker pool.
     # These are not AI requests and do not use external services or credits.
     for label, executor, worker_count in (
-        ("صف کارهای AI/عکس/ویدیو", _AI_JOB_EXECUTOR, AI_JOB_WORKERS),
+        ("صف چت و کدنویسی خصوصی", _AI_JOB_EXECUTOR, AI_JOB_WORKERS),
+        ("صف پاسخ متنی گروه", _GROUP_AI_JOB_EXECUTOR, GROUP_AI_JOB_WORKERS),
         ("صف callback", _CALLBACK_EXECUTOR, CALLBACK_WORKERS),
+        ("صف ساخت تصویر", _IMAGE_JOB_EXECUTOR, IMAGE_JOB_WORKERS),
+        ("صف ساخت ویدیو", _VIDEO_JOB_EXECUTOR, VIDEO_JOB_WORKERS),
     ):
         try:
             probe_count = min(24, max(4, int(worker_count) * 2))
@@ -1289,13 +1775,116 @@ def run_admin_self_tests():
         except Exception as exc:
             record(label, "FAIL", f"{type(exc).__name__}: {str(exc)[:120]}")
 
+    # Build the same production keyboards and perform a non-destructive route walk.
+    # This does not send test messages, alter real user data, or call paid AI services.
+    try:
+        test_uid = str(ADMIN_ID)
+        test_target = f"__neo_selftest_{threading.get_ident()}__"
+        old_lang = _USER_LANG_CACHE.get(test_uid)
+        had_lang = test_uid in _USER_LANG_CACHE
+        _USER_LANG_CACHE[test_uid] = "fa"
+        _USER_MODES_CACHE[test_target] = "CHAT"
+        _USER_MODES_CACHE[test_target + "_group"] = "CHAT"
+
+        model_fixture = [{"name": "Self Test Model", "modelName": "self-test", "supportsVision": True}]
+        chat_models = registry_lists.get("AI_MODELS", [])
+        code_models = registry_lists.get("CODE_MODELS", [])
+        image_models = registry_lists.get("IMAGE_MODELS", [])
+        video_models = registry_lists.get("VIDEO_MODELS", [])
+        override_models = {
+            "chat": chat_models or model_fixture,
+            "code": code_models or chat_models or model_fixture,
+            "image": image_models or model_fixture,
+            "video": video_models or model_fixture,
+        }
+        hub_state = {
+            f"USER_MODEL_{test_target}": "0", f"USER_CODE_MODEL_{test_target}": "0",
+            f"USER_IMG_MODEL_{test_target}": "0", f"USER_VIDEO_MODEL_{test_target}": "0",
+        }
+
+        history_fixture = [{"id": "selftest_session", "title": "تست منو", "date": get_jalali_date()}]
+        history_text, history_markup = build_history_menu_markup(test_uid, history_fixture, "selftest_session")
+        hub_text, hub_markup = build_models_hub_menu(test_target, False, override_models, hub_state)
+        group_hub_text, group_hub_markup = build_models_hub_menu(test_target + "_group", True, override_models, hub_state)
+
+        menus = [
+            ("منوی اصلی", get_main_menu_markup(test_uid, "CHAT")),
+            ("پنل ادمین", get_admin_panel_markup()),
+            ("هاب مدل‌ها", hub_markup),
+            ("هاب مدل‌های گروه", group_hub_markup),
+            ("مدل چت", build_model_selection_markup(test_target, models=override_models["chat"], current_idx="0")),
+            ("مدل کدنویسی", build_model_selection_markup(test_target, models=override_models["code"], current_idx="0", is_code_category=True)),
+            ("مدل عکس", build_image_model_selection_markup(test_target, img_models=override_models["image"], current_idx="0")),
+            ("مدل ویدیو", build_video_model_selection_markup(test_target, video_models=override_models["video"], current_idx="0")),
+            ("تاریخچه", history_markup),
+            ("انتخاب زبان", build_lang_selection_markup(test_uid)),
+            ("لغو عملیات ادمین", get_admin_cancel_markup()),
+            ("عضویت اسپانسر", build_sponsor_markup(test_uid, ["neotenet"])),
+        ]
+        exact_routes, prefixes = _callback_route_rules()
+        all_buttons = 0
+        missing_routes = []
+        overlong_callbacks = []
+        for menu_name, menu_markup in menus:
+            values = _keyboard_callback_values(menu_markup)
+            all_buttons += len(values)
+            for value in values:
+                if not _callback_route_known(value, exact_routes, prefixes):
+                    missing_routes.append(f"{menu_name}:{value}")
+                if len(value.encode("utf-8")) > 64:
+                    overlong_callbacks.append(f"{menu_name}:{value[:30]}")
+            record(f"ساخت منوی {menu_name}", "PASS" if menu_markup is not None else "FAIL",
+                   f"{len(values)} callback ساخته شد")
+
+        record("مسیریابی خودکار دکمه‌ها", "PASS" if not missing_routes else "FAIL",
+               f"{all_buttons} دکمه در {len(menus)} منو بررسی شد؛ " +
+               ("همه callbackها مسیر شناخته‌شده دارند" if not missing_routes else "بدون مسیر: " + ", ".join(missing_routes[:8])))
+        record("محدودیت callback تلگرام", "PASS" if not overlong_callbacks else "FAIL",
+               "همه callback_dataها حداکثر ۶۴ بایت‌اند" if not overlong_callbacks else "بیش از حد: " + ", ".join(overlong_callbacks[:5]))
+
+        # Model the common menu-to-submenu walk; each transition must be routable and its target menu buildable.
+        navigation_pairs = [
+            ("منوی اصلی → هاب مدل‌ها", "models_hub", hub_markup),
+            ("هاب مدل‌ها → مدل چت", "models_cat_chat", build_model_selection_markup(test_target, models=override_models["chat"], current_idx="0")),
+            ("هاب مدل‌ها → مدل کدنویسی", "models_cat_code", build_model_selection_markup(test_target, models=override_models["code"], current_idx="0", is_code_category=True)),
+            ("هاب مدل‌ها → مدل عکس", "models_cat_image", build_image_model_selection_markup(test_target, img_models=override_models["image"], current_idx="0")),
+            ("هاب مدل‌ها → مدل ویدیو", "models_cat_video", build_video_model_selection_markup(test_target, video_models=override_models["video"], current_idx="0")),
+            ("منوی اصلی → تاریخچه", "history_menu", history_markup),
+            ("منوی اصلی → پنل ادمین", "admin_panel", get_admin_panel_markup()),
+            ("پنل ادمین → تست سلامت", "admin_self_test", get_admin_panel_markup()),
+        ]
+        broken_walk = [name for name, callback, target_markup in navigation_pairs
+                       if not _callback_route_known(callback, exact_routes, prefixes) or target_markup is None]
+        record("گردش خودکار بین زیرمنوها", "PASS" if not broken_walk else "FAIL",
+               f"{len(navigation_pairs)} مسیر بررسی شد؛ بدون ارسال پیام آزمایشی یا تغییر داده واقعی" +
+               ("" if not broken_walk else "; مشکل: " + ", ".join(broken_walk)))
+    except Exception as exc:
+        record("تست خودکار منوها و دکمه‌ها", "FAIL", f"{type(exc).__name__}: {str(exc)[:160]}")
+    finally:
+        try:
+            if 'test_uid' in locals():
+                if had_lang:
+                    _USER_LANG_CACHE[test_uid] = old_lang
+                else:
+                    _USER_LANG_CACHE.pop(test_uid, None)
+            if 'test_target' in locals():
+                _USER_MODES_CACHE.pop(test_target, None)
+                _USER_MODES_CACHE.pop(test_target + "_group", None)
+        except Exception:
+            pass
+
     # Capacity snapshot, not a performance guarantee.
     try:
         ai_waiting = getattr(getattr(_AI_JOB_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
+        group_ai_waiting = getattr(getattr(_GROUP_AI_JOB_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
         callback_waiting = getattr(getattr(_CALLBACK_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
+        image_waiting = getattr(getattr(_IMAGE_JOB_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
+        video_waiting = getattr(getattr(_VIDEO_JOB_EXECUTOR, "_work_queue", None), "qsize", lambda: -1)()
         record("ظرفیت پردازش (نمای لحظه‌ای)", "INFO",
                f"Handler={TELEGRAM_HANDLER_THREADS} | Callback={CALLBACK_WORKERS}+{CALLBACK_QUEUE_LIMIT} | "
-               f"AI={AI_JOB_WORKERS}+{AI_JOB_QUEUE_LIMIT} | صف فعلی callback={callback_waiting} و AI={ai_waiting}")
+               f"Chat/Code={AI_JOB_WORKERS}+{AI_JOB_QUEUE_LIMIT} | Group={GROUP_AI_JOB_WORKERS}+{GROUP_AI_JOB_QUEUE_LIMIT} | "
+               f"Image={IMAGE_JOB_WORKERS}+{IMAGE_JOB_QUEUE_LIMIT} | Video={VIDEO_JOB_WORKERS}+{VIDEO_JOB_QUEUE_LIMIT} | "
+               f"صف فعلی callback={callback_waiting}، چت={ai_waiting}، گروه={group_ai_waiting}، عکس={image_waiting}، ویدیو={video_waiting}")
     except Exception as exc:
         record("ظرفیت پردازش", "WARN", f"قابل خواندن نیست: {type(exc).__name__}")
 
@@ -1312,7 +1901,7 @@ def run_admin_self_tests():
         lines.append(f"{icons.get(status, 'ℹ️')} {label}: {detail}")
     lines.extend([
         "",
-        "محدودیت تست: برای جلوگیری از مصرف اعتبار، از هر مدل هوش مصنوعی درخواست واقعی ارسال نمی‌شود؛ این گزارش اتصال‌ها، ساختار مدل‌ها، هندلرها، فراخوانی گروه و صف‌های داخلی را بررسی می‌کند.",
+        "محدودیت تست: منوها و مسیرهای callback به‌صورت داخلی و بدون دست‌کاری اطلاعات واقعی شبیه‌سازی می‌شوند؛ از مدل‌ها درخواست پولی ارسال نمی‌شود. تست مسیر منو، اتصال شبکه یا پاسخ واقعی همه سرویس‌ها را تضمین نمی‌کند. درخواست‌های متنی گروه صف مجزایی دارند و پاسخ استریم‌شده در گروه به‌صورت تدریجی نمایش داده می‌شود.",
     ])
     return "\n".join(lines), {"passed": passed, "failed": failed, "warnings": warnings}
 
@@ -1383,34 +1972,52 @@ def _escape_markdown_value(value):
     return clean.replace("`", "ˋ")
 
 
+def _cache_selected_model_display_name(user_id, mode, name, lang=None):
+    lang_key = lang or _USER_LANG_CACHE.get(str(user_id), "fa")
+    result = _escape_markdown_value(name) if name else ("انتخاب نشده" if lang_key == "fa" else "Not selected")
+    cache_key = (str(user_id), str(mode), lang_key)
+    with _SELECTED_MODEL_DISPLAY_LOCK:
+        _SELECTED_MODEL_DISPLAY_CACHE[cache_key] = (time.monotonic(), result)
+    return result
+
+
 def get_selected_model_display_name(user_id, current_mode=None):
-    """Return the model selected for the currently active private-chat mode."""
+    """Return the selected model name with short caching to keep menu edits responsive."""
     mode = current_mode or get_user_current_mode(user_id)
-    lang_fallback = "انتخاب نشده" if get_user_lang(user_id) == "fa" else "Not selected"
+    lang = get_user_lang(user_id)
+    lang_fallback = "انتخاب نشده" if lang == "fa" else "Not selected"
+    cache_key = (str(user_id), str(mode), lang)
+    now = time.monotonic()
+    with _SELECTED_MODEL_DISPLAY_LOCK:
+        cached = _SELECTED_MODEL_DISPLAY_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < _SELECTED_MODEL_DISPLAY_TTL:
+            return cached[1]
 
     if mode == "CHAT":
         models = get_ai_models_cached() or []
-        index_raw = safe_kv_get(f"USER_MODEL_{user_id}") or "0"
+        index_key = f"USER_MODEL_{user_id}"
     elif mode == "CODE":
         models = get_code_models_cached() or []
-        if models:
-            index_raw = safe_kv_get(f"USER_CODE_MODEL_{user_id}") or "0"
-        else:
-            # Preserve the bot's backward-compatible chat-model fallback when no
-            # dedicated programming models have been configured yet.
+        index_key = f"USER_CODE_MODEL_{user_id}"
+        if not models:
             models = get_ai_models_cached() or []
-            index_raw = safe_kv_get(f"USER_MODEL_{user_id}") or "0"
+            index_key = f"USER_MODEL_{user_id}"
     elif mode == "IMAGE":
         models = get_img_models_cached() or []
-        index_raw = safe_kv_get(f"USER_IMG_MODEL_{user_id}") or "0"
+        index_key = f"USER_IMG_MODEL_{user_id}"
     elif mode == "VIDEO":
         models = get_video_models_cached() or []
-        index_raw = safe_kv_get(f"USER_VIDEO_MODEL_{user_id}") or "0"
+        index_key = f"USER_VIDEO_MODEL_{user_id}"
     else:
-        return "نامشخص" if get_user_lang(user_id) == "fa" else "Unknown"
+        return "نامشخص" if lang == "fa" else "Unknown"
 
+    index_raw = _model_selection_get_cached(index_key)
+    if index_raw is None:
+        index_raw = safe_kv_get(index_key) or "0"
+        with _MODEL_SELECTION_CACHE_LOCK:
+            _MODEL_SELECTION_CACHE[index_key] = (time.monotonic(), str(index_raw))
     if not models:
-        return lang_fallback
+        return _cache_selected_model_display_name(user_id, mode, None, lang)
     try:
         idx = int(index_raw)
     except (TypeError, ValueError):
@@ -1419,7 +2026,7 @@ def get_selected_model_display_name(user_id, current_mode=None):
         idx = 0
     model = models[idx] if isinstance(models[idx], dict) else {}
     name = model.get("name") or model.get("modelName") or model.get("model")
-    return _escape_markdown_value(name) if name else lang_fallback
+    return _cache_selected_model_display_name(user_id, mode, name, lang) if name else _cache_selected_model_display_name(user_id, mode, None, lang)
 
 
 def build_main_menu_welcome_text(user_id, current_mode=None):
@@ -1435,11 +2042,17 @@ def refresh_main_menu_banner(chat_id, user_id, message_id=None):
     if str(chat_id) != str(user_id):
         return False  # private welcome banners are never edited from group callbacks
     if message_id is None:
-        raw_id = safe_kv_get(f"MAIN_MENU_MESSAGE_ID_{user_id}")
-        try:
-            message_id = int(raw_id) if raw_id else None
-        except (TypeError, ValueError):
-            message_id = None
+        with _MAIN_MENU_MESSAGE_ID_LOCK:
+            message_id = _MAIN_MENU_MESSAGE_ID_CACHE.get(str(user_id))
+        if not message_id:
+            raw_id = safe_kv_get(f"MAIN_MENU_MESSAGE_ID_{user_id}")
+            try:
+                message_id = int(raw_id) if raw_id else None
+            except (TypeError, ValueError):
+                message_id = None
+            if message_id:
+                with _MAIN_MENU_MESSAGE_ID_LOCK:
+                    _MAIN_MENU_MESSAGE_ID_CACHE[str(user_id)] = int(message_id)
     if not message_id:
         return False
     mode = get_user_current_mode(user_id)
@@ -1451,11 +2064,13 @@ def refresh_main_menu_banner(chat_id, user_id, message_id=None):
             parse_mode="Markdown",
             reply_markup=get_main_menu_markup(user_id, mode),
         )
-        safe_kv_put(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(message_id))
+        with _MAIN_MENU_MESSAGE_ID_LOCK:
+            _MAIN_MENU_MESSAGE_ID_CACHE[str(user_id)] = int(message_id)
         return True
     except Exception as exc:
         if "message is not modified" in str(exc).lower():
-            safe_kv_put(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(message_id))
+            with _MAIN_MENU_MESSAGE_ID_LOCK:
+                _MAIN_MENU_MESSAGE_ID_CACHE[str(user_id)] = int(message_id)
             return True
         print(f"[Main Menu Banner Refresh Error]: {exc}")
         return False
@@ -1473,7 +2088,8 @@ def send_main_menu(chat_id, user_id, message_id=None):
                 parse_mode="Markdown",
                 reply_markup=get_main_menu_markup(user_id, current_mode),
             )
-            safe_kv_put(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(message_id))
+            with _MAIN_MENU_MESSAGE_ID_LOCK:
+                _MAIN_MENU_MESSAGE_ID_CACHE[str(user_id)] = int(message_id)
             return
         except Exception:
             # Fall back to a new menu if the clicked message cannot be edited.
@@ -1492,17 +2108,24 @@ def send_main_menu(chat_id, user_id, message_id=None):
         reply_markup=get_main_menu_markup(user_id, current_mode),
     )
     try:
-        safe_kv_put(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(menu_message.message_id))
+        with _MAIN_MENU_MESSAGE_ID_LOCK:
+            _MAIN_MENU_MESSAGE_ID_CACHE[str(user_id)] = int(menu_message.message_id)
+        _persist_kv_async(f"MAIN_MENU_MESSAGE_ID_{user_id}", str(menu_message.message_id))
     except Exception as exc:
-        print(f"[Main Menu Message Save Error]: {exc}")
+        print(f"[Main Menu Message Save Error]: {type(exc).__name__}")
 
-def send_lang_selection_menu(chat_id, user_id, message_id=None):
+def build_lang_selection_markup(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🇮🇷 فارسی", callback_data="set_lang_fa", style="primary"),
         types.InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en", style="primary")
     )
     markup.add(types.InlineKeyboardButton("🔙 بازگشت / Back", callback_data="main_menu"))
+    return markup
+
+
+def send_lang_selection_menu(chat_id, user_id, message_id=None):
+    markup = build_lang_selection_markup(user_id)
     text = tr(user_id, "lang_select_title")
     if message_id:
         try:
@@ -1522,40 +2145,14 @@ def build_sponsor_markup(user_id, unjoined_channels):
     markup.add(types.InlineKeyboardButton(tr(user_id, "sponsor_check_btn"), callback_data="check_sponsor", style="success"))
     return markup
 
-def send_history_menu(chat_id, user_id, message_id=None):
-    # Read the two history keys in a single Redis round-trip.
-    history_values = batch_kv_get([f"SESSIONS_{user_id}", f"ACTIVE_SESSION_{user_id}"])
-    try:
-        raw_sessions = json.loads(history_values.get(f"SESSIONS_{user_id}") or "[]")
-        sessions = [item for item in raw_sessions if isinstance(item, dict) and item.get("id")] if isinstance(raw_sessions, list) else []
-    except Exception:
-        sessions = []
-    active_sess = history_values.get(f"ACTIVE_SESSION_{user_id}")
-    if not sessions:
-        # A first-time user should see the default chat immediately; no manual add is needed.
-        get_or_create_active_session(user_id)
-        sessions = load_user_sessions(user_id)
-        active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
-
-    if not sessions:
-        empty_text = "📜 هیچ تاریخچه گفتگویی در حافظه یافت نشد." if get_user_lang(user_id) == "fa" else "📜 No chat history found."
-        if message_id:
-            try:
-                bot.edit_message_text(empty_text, chat_id=chat_id, message_id=message_id)
-                return
-            except Exception:
-                pass
-        bot.send_message(chat_id, empty_text)
-        return
-
+def build_history_menu_markup(user_id, sessions, active_sess):
+    """Build the real history-menu keyboard without performing writes or sending messages."""
     markup = types.InlineKeyboardMarkup()
-    sessions = save_sessions_limited(user_id, sessions, active_id=active_sess)
-    for s in sessions[:MAX_SAVED_SESSIONS]:
-        sid = s.get("id")
+    for session in (sessions or [])[:MAX_SAVED_SESSIONS]:
+        sid = session.get("id")
         is_cur = "🟢 " if str(sid) == str(active_sess) else "💬 "
-        date_str = format_session_display(s, user_id)
-        safe_title = " ".join(str(s.get("title") or "گفتگوی بدون عنوان").split())
-        # Telegram inline-button labels are limited to 64 characters; reserve room for date/time.
+        date_str = format_session_display(session, user_id)
+        safe_title = " ".join(str(session.get("title") or "گفتگوی بدون عنوان").split())
         title_budget = max(12, 61 - len(is_cur) - len(date_str))
         safe_title = safe_title[:title_budget]
         title = f"{is_cur}{safe_title} [{date_str}]"[:64]
@@ -1572,10 +2169,39 @@ def send_history_menu(chat_id, user_id, message_id=None):
         "❔ راهنمای تاریخچه گفتگوها" if get_user_lang(user_id) == "fa" else "❔ Chat history guide",
         callback_data="history_help"
     ))
-
     text = ("📜 تاریخچه گفتگوها (حداکثر ۷ مورد) — ساعت به وقت ایران:\n"
             "🟢 گفتگوی علامت‌دار، گفتگوی فعال شماست. چت‌های جدید خودکار ذخیره می‌شوند." if get_user_lang(user_id) == "fa"
             else "📜 Saved chats (up to 7) — Iran local time. New chats are saved automatically; 🟢 marks the active chat.")
+    return text, markup
+
+
+def send_history_menu(chat_id, user_id, message_id=None):
+    # Read the two history keys in a single Redis round-trip.
+    history_values = batch_kv_get([f"SESSIONS_{user_id}", f"ACTIVE_SESSION_{user_id}"])
+    try:
+        raw_sessions = json.loads(history_values.get(f"SESSIONS_{user_id}") or "[]")
+        sessions = [item for item in raw_sessions if isinstance(item, dict) and item.get("id")] if isinstance(raw_sessions, list) else []
+    except Exception:
+        sessions = []
+    active_sess = history_values.get(f"ACTIVE_SESSION_{user_id}")
+    if not sessions:
+        get_or_create_active_session(user_id)
+        sessions = load_user_sessions(user_id)
+        active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
+
+    if not sessions:
+        empty_text = "📜 هیچ تاریخچه گفتگویی در حافظه یافت نشد." if get_user_lang(user_id) == "fa" else "📜 No chat history found."
+        if message_id:
+            try:
+                bot.edit_message_text(empty_text, chat_id=chat_id, message_id=message_id)
+                return
+            except Exception:
+                pass
+        bot.send_message(chat_id, empty_text)
+        return
+
+    sessions = save_sessions_limited(user_id, sessions, active_id=active_sess)
+    text, markup = build_history_menu_markup(user_id, sessions, active_sess)
     if message_id:
         try:
             bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
@@ -1587,11 +2213,18 @@ def send_history_menu(chat_id, user_id, message_id=None):
 # ==========================================
 # 🎛 هاب جامع انتخاب ۳ مدل کاملاً مستقل
 # ==========================================
-def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
-    chat_models = get_ai_models_cached()
-    code_models = get_code_models_cached() or chat_models  # Backward compatibility before dedicated code models are configured.
-    img_models = get_img_models_cached()
-    video_models = get_video_models_cached()
+def build_models_hub_menu(target_key_id, is_group=False, models_override=None, state_values_override=None):
+    """Build the actual model-hub screen without sending a Telegram message."""
+    if models_override is None:
+        chat_models = get_ai_models_cached()
+        code_models = get_code_models_cached() or chat_models
+        img_models = get_img_models_cached()
+        video_models = get_video_models_cached()
+    else:
+        chat_models = models_override.get("chat", [])
+        code_models = models_override.get("code", []) or chat_models
+        img_models = models_override.get("image", [])
+        video_models = models_override.get("video", [])
 
     state_keys = [
         f"USER_MODEL_{target_key_id}",
@@ -1599,7 +2232,29 @@ def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
         f"USER_IMG_MODEL_{target_key_id}",
         f"USER_VIDEO_MODEL_{target_key_id}",
     ]
-    state_values = batch_kv_get(state_keys)
+    if state_values_override is not None:
+        state_values = state_values_override
+    else:
+        state_values = {}
+        missing_state_keys = []
+        now_cache = time.monotonic()
+        with _MODEL_SELECTION_CACHE_LOCK:
+            for state_key in state_keys:
+                cached_state = _MODEL_SELECTION_CACHE.get(state_key)
+                if cached_state and (now_cache - cached_state[0]) < _MODEL_SELECTION_CACHE_TTL:
+                    state_values[state_key] = cached_state[1]
+                else:
+                    missing_state_keys.append(state_key)
+        if missing_state_keys:
+            fetched_state = batch_kv_get(missing_state_keys)
+            state_values.update(fetched_state)
+            with _MODEL_SELECTION_CACHE_LOCK:
+                fetched_at = time.monotonic()
+                for state_key, state_value in fetched_state.items():
+                    if state_value is not None:
+                        _MODEL_SELECTION_CACHE[state_key] = (fetched_at, str(state_value))
+        for state_key in state_keys:
+            state_values.setdefault(state_key, None)
 
     def _safe_index(value, default=0):
         try:
@@ -1677,6 +2332,11 @@ def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
         )
         markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu"))
 
+    return text, markup
+
+
+def send_models_hub(chat_id, target_key_id, is_group=False, message_id=None):
+    text, markup = build_models_hub_menu(target_key_id, is_group=is_group)
     if message_id:
         try:
             bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown", reply_markup=markup)
@@ -1704,7 +2364,7 @@ def build_model_selection_markup(target_key_id, is_group=False, models=None, cur
 def build_video_model_selection_markup(target_key_id, is_group=False, video_models=None, current_idx=None):
     if video_models is None or current_idx is None:
         video_models = get_video_models_cached()
-        current_idx = safe_kv_get(f"USER_VIDEO_MODEL_{target_key_id}") or "0"
+        current_idx = _model_selection_get_or_load(f"USER_VIDEO_MODEL_{target_key_id}")
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for idx, model in enumerate(video_models):
@@ -1721,7 +2381,7 @@ def build_video_model_selection_markup(target_key_id, is_group=False, video_mode
 def build_image_model_selection_markup(target_key_id, is_group=False, img_models=None, current_idx=None):
     if img_models is None or current_idx is None:
         img_models = get_img_models_cached()
-        current_idx = safe_kv_get(f"USER_IMG_MODEL_{target_key_id}") or "0"
+        current_idx = _model_selection_get_or_load(f"USER_IMG_MODEL_{target_key_id}")
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
@@ -2366,6 +3026,9 @@ def clean_system_cache(admin_chat_id):
         f"USER_SUPPORT_STEP_{ADMIN_ID}", f"AWAITING_IMG_{ADMIN_ID}"
     ]
     upstash_command(["DEL"] + keys_to_del)
+    with _TEMP_STATE_CACHE_LOCK:
+        for temp_key in keys_to_del:
+            _TEMP_STATE_CACHE.pop(temp_key, None)
 
     report = (
         "⚡ **عملیات پاکسازی کش موقت با موفقیت و در کمتر از ۰.۱ ثانیه انجام شد!**\n\n"
@@ -2440,21 +3103,74 @@ def send_admin_sponsor_list(chat_id, message_id=None):
     bot.send_message(chat_id, list_text, reply_markup=markup)
 
 # ==========================================
-# ۳. پردازش هوش مصنوعی با تایمر زنده و وب‌گردی فنی
+# ۳. پردازش هوش مصنوعی با وضعیت ثابت و وب‌گردی فنی
 # ==========================================
-def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id, thread_id=None, active_mode="CHAT"):
+def _worker_ai_process_impl(chat_id, user_id, message, text_prompt, target_key_id, is_group,
+                            target_reply_id, thread_id=None, active_mode="CHAT",
+                            precreated_status_msg=None, request_id=None, submitted_at=None):
+    # Edit the queued acknowledgement immediately, before Redis reads or model setup.
+    worker_started_at = time.monotonic()
+    req_id = request_id or f"{user_id}_{time.time_ns()}"
+    reply_to = target_reply_id if target_reply_id else (message.message_id if is_group else None)
+    status_msg = precreated_status_msg
+    stream_preview_active = False
+    cancel_markup = types.InlineKeyboardMarkup()
+    cancel_markup.add(types.InlineKeyboardButton("❌ لغو درخواست", callback_data=f"cancel_req_{req_id}", style="danger"))
+    if status_msg is not None:
+        _edit_processing_ack(chat_id, status_msg, "💬 در حال فکر کردن...", reply_markup=cancel_markup)
+    else:
+        status_msg = _send_processing_ack(
+            chat_id, "💬 در حال فکر کردن...", thread_id=thread_id,
+            reply_to_message_id=reply_to, reply_markup=cancel_markup,
+        )
+    if submitted_at is not None:
+        print(f"[AI Timing] worker_started user={user_id} group={is_group} queue_wait={max(0.0, time.monotonic()-submitted_at):.2f}s")
+    if req_id in _CANCEL_REQS:
+        _edit_processing_ack(chat_id, status_msg, "❌ درخواست لغو شد.")
+        _CANCEL_REQS.discard(req_id)
+        return
+    if status_msg is None:
+        print(f"[AI Worker Error] user={user_id}: could not create a Telegram status message")
+        return
+
+    # Only fetch the registry needed for this mode; the old path fetched both on every chat request.
     chat_models = get_ai_models_cached()
-    code_models = get_code_models_cached()
-    models = (code_models or chat_models) if active_mode == "CODE" else chat_models
-    active_session_id = get_or_create_active_session(user_id)
-    if not is_group:
-        update_session_title_if_new(user_id, active_session_id, text_prompt)
+    models = (get_code_models_cached() or chat_models) if active_mode == "CODE" else chat_models
+    # Group requests must not load or rewrite an individual's private-session metadata.
+    # Their history is scoped to the group and uses one GET + one SET per completed turn.
+    if is_group:
+        active_session_id = None
+        history_key = f"GROUP_HISTORY_{chat_id}_{user_id}"
+    else:
+        active_session_id = get_or_create_active_session(user_id)
+        history_key = f"HISTORY_{user_id}_{active_session_id}"
     lang = get_user_lang(user_id)
 
     if active_mode == "CODE":
-        user_selected = safe_kv_get(f"USER_CODE_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{user_id}") or "0"
+        selection_keys = [f"USER_CODE_MODEL_{target_key_id}", f"USER_MODEL_{target_key_id}", f"USER_MODEL_{user_id}"]
     else:
-        user_selected = safe_kv_get(f"USER_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{user_id}") or "0"
+        selection_keys = [f"USER_MODEL_{target_key_id}", f"USER_MODEL_{user_id}"]
+    selection_values = {}
+    missing_selection_keys = []
+    now_selection_cache = time.monotonic()
+    with _MODEL_SELECTION_CACHE_LOCK:
+        for selection_key in selection_keys:
+            cached_selection = _MODEL_SELECTION_CACHE.get(selection_key)
+            if cached_selection and (now_selection_cache - cached_selection[0]) < _MODEL_SELECTION_CACHE_TTL:
+                selection_values[selection_key] = cached_selection[1]
+            else:
+                missing_selection_keys.append(selection_key)
+    if missing_selection_keys:
+        fetched_selection_values = batch_kv_get(missing_selection_keys)
+        for selection_key, selection_value in fetched_selection_values.items():
+            stored_value = str(selection_value) if selection_value not in (None, "") else "0"
+            selection_values[selection_key] = stored_value
+            with _MODEL_SELECTION_CACHE_LOCK:
+                _MODEL_SELECTION_CACHE[selection_key] = (time.monotonic(), stored_value)
+    user_selected = next(
+        (str(selection_values.get(key)) for key in selection_keys if selection_values.get(key) not in (None, "")),
+        "0",
+    )
 
     try:
         model_idx = int(user_selected)
@@ -2468,7 +3184,17 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
 
     if not models or model_idx < 0 or model_idx >= len(models):
         need = "مدل برنامه‌نویسی" if active_mode == "CODE" else "مدل چت"
-        bot.send_message(chat_id, f"⚠️ ابتدا یک {need} در ربات ثبت کنید." if lang == "fa" else f"⚠️ Please add a {('coding' if active_mode == 'CODE' else 'chat')} model first.", message_thread_id=thread_id)
+        warning_text = f"⚠️ ابتدا یک {need} در ربات ثبت کنید." if lang == "fa" else f"⚠️ Please add a {('coding' if active_mode == 'CODE' else 'chat')} model first."
+        if status_msg is not None:
+            try:
+                bot.edit_message_text(warning_text, chat_id=chat_id, message_id=status_msg.message_id)
+            except Exception:
+                try:
+                    bot.send_message(chat_id, warning_text, message_thread_id=thread_id)
+                except Exception:
+                    pass
+        else:
+            bot.send_message(chat_id, warning_text, message_thread_id=thread_id)
         return
 
     active_model = models[model_idx]
@@ -2485,75 +3211,30 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
     native_web_provider = get_native_web_provider(active_model)
     is_web_query = bool(text_prompt and text_prompt.strip()) and not is_greeting and bool(native_web_provider)
 
-    req_id = f"{user_id}_{int(time.time()*1000)}"
-    cancel_markup = types.InlineKeyboardMarkup()
-    cancel_markup.add(types.InlineKeyboardButton(tr(user_id, "cancel_btn"), callback_data=f"cancel_req_{req_id}", style="danger"))
-
-    reply_to = target_reply_id if target_reply_id else (message.message_id if is_group else None)
-    
     if is_web_query:
         mode_icon = "🌐"
-        initial_text = f"🌐 در حال جست‌وجو با ابزار بومی API... ⏱️ 00:00" if lang == "fa" else f"🌐 Searching with the API's native web tool... ⏱️ 00:00"
+        initial_text = "🌐 در حال جست‌وجو با ابزار بومی API..." if lang == "fa" else "🌐 Searching with the API's native web tool..."
     else:
         mode_icon = "💻" if active_mode == "CODE" else "💬"
-        initial_text = f"{mode_icon} در حال پردازش با {active_model.get('name')}... ⏱️ 00:00" if lang == "fa" else f"{mode_icon} Processing with {active_model.get('name')}... ⏱️ 00:00"
+        initial_text = "💬 در حال فکر کردن..." if lang == "fa" else "💬 Thinking..."
 
-    try:
-        status_msg = bot.send_message(
-            chat_id, initial_text,
-            reply_markup=cancel_markup,
-            reply_to_message_id=reply_to,
-            allow_sending_without_reply=True,
-            message_thread_id=thread_id
-        )
-    except Exception:
-        status_msg = bot.send_message(chat_id, initial_text, reply_markup=cancel_markup, message_thread_id=thread_id)
+    if status_msg is not None:
+        _edit_processing_ack(chat_id, status_msg, initial_text, reply_markup=cancel_markup)
+    else:
+        try:
+            status_msg = bot.send_message(
+                chat_id, initial_text,
+                reply_markup=cancel_markup,
+                reply_to_message_id=reply_to,
+                allow_sending_without_reply=True,
+                message_thread_id=thread_id
+            )
+        except Exception:
+            status_msg = bot.send_message(chat_id, initial_text, reply_markup=cancel_markup, message_thread_id=thread_id)
 
     status_msg_id = status_msg.message_id
-    is_done = False
     api_response_text = None
     source_links = []
-    start_time = time.time()
-
-    def timer_loop():
-        last_edit_time = 0
-        edit_interval = 1.5
-
-        while not is_done:
-            time.sleep(0.5)
-            if is_done or (req_id in _CANCEL_REQS):
-                break
-
-            now = time.time()
-            elapsed = int(now - start_time)
-            if elapsed >= 2100:
-                break
-
-            if now - last_edit_time >= edit_interval:
-                mins = elapsed // 60
-                secs = elapsed % 60
-                time_display = f"{mins:02d}:{secs:02d}"
-
-                if is_web_query:
-                    cur_txt = f"🌐 در حال جست‌وجو با ابزار بومی API... ⏱️ {time_display}" if lang == "fa" else f"🌐 Using provider-native web search... ⏱️ {time_display}"
-                else:
-                    cur_txt = f"{mode_icon} در حال تفکر و پردازش... ⏱️ {time_display}" if lang == "fa" else f"{mode_icon} Thinking... ⏱️ {time_display}"
-                
-                try:
-                    bot.edit_message_text(cur_txt, chat_id=chat_id, message_id=status_msg_id, reply_markup=cancel_markup)
-                    last_edit_time = now
-                except ApiTelegramException as te:
-                    if te.error_code == 429:
-                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
-                        last_edit_time = now + wait_time
-                    elif "message is not modified" in str(te).lower():
-                        last_edit_time = now
-                    else:
-                        last_edit_time = now + 1
-                except Exception:
-                    last_edit_time = now + 1
-
-    threading.Thread(target=timer_loop, daemon=True).start()
 
     try:
         web_context_prompt = ""
@@ -2567,12 +3248,11 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 "answer from existing knowledge only and clearly state this limitation when current web facts are required."
             )
 
-        history = json.loads(safe_kv_get(f"HISTORY_{user_id}_{active_session_id}") or "[]")
+        history = _load_chat_history(history_key)
         user_content = user_prompt_final
 
         if message.photo:
             if not active_model.get("supportsVision"):
-                is_done = True
                 bot.edit_message_text("❌ این مدل از تحلیل عکس پشتیبانی نمی‌کند." if lang == "fa" else "❌ This model does not support Vision.", chat_id=chat_id, message_id=status_msg_id)
                 return
 
@@ -2665,6 +3345,12 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        if req_id in _CANCEL_REQS:
+            _edit_processing_ack(chat_id, status_msg, "❌ درخواست لغو شد.")
+            return
+        api_started_at = time.monotonic()
+        first_content_logged = False
+        print(f"[AI Timing] api_request_started user={user_id} group={is_group} mode={active_mode} model={str(active_model.get('modelName', ''))[:80]}")
         if native_responses_mode:
             responses_payload = {
                 "model": active_model.get("modelName", "").strip(),
@@ -2677,13 +3363,15 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             }
             res = http_session.post(
                 get_responses_endpoint(base_url), headers=headers,
-                json=responses_payload, timeout=(45, 2100), stream=False
+                json=responses_payload, timeout=(45, API_TIMEOUT_SECONDS), stream=False
             )
+            print(f"[AI Timing] response_received user={user_id} mode={active_mode} elapsed={time.monotonic()-api_started_at:.2f}s streaming=off")
         else:
             res = http_session.post(
                 endpoint, headers=headers, json=payload,
-                timeout=(45, 2100), stream=bool(payload.get("stream", True))
+                timeout=(45, API_TIMEOUT_SECONDS), stream=bool(payload.get("stream", True))
             )
+            print(f"[AI Timing] response_headers user={user_id} mode={active_mode} elapsed={time.monotonic()-api_started_at:.2f}s content_type={res.headers.get('Content-Type', '')[:80]}")
         res.encoding = 'utf-8'
 
         if res.status_code == 200:
@@ -2700,7 +3388,11 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 is_stream_response = "text/event-stream" in content_type
 
                 if is_stream_response:
-                    for raw_line in res.iter_lines():
+                    last_stream_edit = 0.0
+                    last_stream_preview = ""
+                    # Requests defaults to 512-byte chunks, which can delay short SSE tokens.
+                    # A one-byte chunk size yields streamed lines as soon as the provider sends them.
+                    for raw_line in res.iter_lines(chunk_size=1, decode_unicode=False):
                         if req_id in _CANCEL_REQS:
                             break
                         if not raw_line:
@@ -2721,6 +3413,28 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                                     c = choice.get("text")
                                 if c:
                                     full_content += c
+                                    if not first_content_logged:
+                                        first_content_logged = True
+                                        print(f"[AI Timing] first_content user={user_id} group={is_group} elapsed={time.monotonic()-api_started_at:.2f}s")
+                                    # Group users see safe partial text earlier; internal <think> is filtered.
+                                    # Keep Telegram edits throttled to avoid excessive edit requests.
+                                    if status_msg_id:
+                                        now_mono = time.monotonic()
+                                        preview = _safe_stream_preview(full_content)
+                                        if (len(preview) >= 8 and preview != last_stream_preview
+                                                and now_mono - last_stream_edit >= 1.5):
+                                            try:
+                                                bot.edit_message_text(
+                                                    preview[:3900], chat_id=chat_id,
+                                                    message_id=status_msg_id, reply_markup=cancel_markup,
+                                                )
+                                                last_stream_preview = preview[:3900]
+                                                last_stream_edit = now_mono
+                                                stream_preview_active = True
+                                            except ApiTelegramException as stream_exc:
+                                                last_stream_edit = now_mono + (3.0 if getattr(stream_exc, "error_code", None) == 429 else 1.0)
+                                            except Exception:
+                                                last_stream_edit = now_mono + 1.0
                                 if r:
                                     full_reasoning += r
                             except Exception:
@@ -2754,7 +3468,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                     clean_b = base_url.rstrip("/")
                     retry_endpoint = f"{clean_b}/v1/chat/completions"
 
-                retry_res = http_session.post(retry_endpoint, headers=headers, json=retry_payload, timeout=60)
+                retry_res = http_session.post(retry_endpoint, headers=headers, json=retry_payload, timeout=API_TIMEOUT_SECONDS)
                 if retry_res.status_code == 200:
                     r_data = retry_res.json()
                     r_msg = r_data.get("choices", [{}])[0].get("message", {})
@@ -2765,6 +3479,7 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             except Exception:
                 pass
 
+        print(f"[AI Timing] response_parsed user={user_id} group={is_group} elapsed={time.monotonic()-api_started_at:.2f}s")
         if not api_response_text or not api_response_text.strip():
             if res.status_code != 200:
                 api_response_text = f"❌ خطای API ({res.status_code}):\n{res.text[:220]}"
@@ -2791,23 +3506,34 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
                 else:
                     hist_to_save.append(item)
 
-            safe_kv_put(f"HISTORY_{user_id}_{active_session_id}", hist_to_save)
-            update_session_title_if_new(user_id, active_session_id, text_prompt)
+            # Update the local sanitized history first so the next prompt has context,
+            # then persist in the background without delaying delivery to Telegram.
+            _history_cache_put(history_key, hist_to_save)
+            if is_group:
+                _persist_kv_async(history_key, hist_to_save, 30 * 24 * 60 * 60)
+            else:
+                _persist_kv_async(history_key, hist_to_save)
+                try:
+                    _SETTINGS_PERSIST_EXECUTOR.submit(
+                        update_session_title_if_new, user_id, active_session_id, text_prompt
+                    )
+                except Exception as persist_exc:
+                    print(f"[Async Session Title Warning] user={user_id}: {type(persist_exc).__name__}")
 
     except requests.exceptions.Timeout:
-        api_response_text = "❌ زمان پاسخ بیش از ۳۵ دقیقه شد و قطع گردید." if lang == "fa" else "❌ Request timed out."
+        api_response_text = "❌ زمان پاسخ بیش از ۱ ساعت شد و قطع گردید." if lang == "fa" else "❌ Request timed out."
     except requests.exceptions.ConnectionError:
         api_response_text = "❌ خطای قطع ارتباط با سرور هوش مصنوعی." if lang == "fa" else "❌ Connection error with AI server."
     except Exception as e:
         api_response_text = f"❌ Error: {type(e).__name__} - {str(e)[:100]}"
     finally:
-        is_done = True
         _CANCEL_REQS.discard(req_id)
         safe_kv_delete(f"CANCEL_{req_id}")
 
+    print(f"[AI Timing] worker_finished user={user_id} group={is_group} total={time.monotonic()-worker_started_at:.2f}s")
     if api_response_text and not api_response_text.startswith("❌"):
         # Do not prepend internal user/model metadata to group replies.
-        # The chosen model remains visible in the temporary processing message while running.
+        # The temporary status remains generic and never exposes the selected model name.
         final_text = clean_text
         send_safe_ai_response(chat_id, status_msg_id, final_text, reply_to, thread_id)
         
@@ -2830,10 +3556,35 @@ def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_
             except Exception:
                 pass
 
+
+def worker_ai_process(chat_id, user_id, message, text_prompt, target_key_id, is_group,
+                      target_reply_id, thread_id=None, active_mode="CHAT",
+                      precreated_status_msg=None, request_id=None, submitted_at=None):
+    """Guard the entire AI worker, including model/Redis preflight before API call."""
+    try:
+        return _worker_ai_process_impl(
+            chat_id, user_id, message, text_prompt, target_key_id, is_group, target_reply_id,
+            thread_id=thread_id, active_mode=active_mode,
+            precreated_status_msg=precreated_status_msg, request_id=request_id,
+            submitted_at=submitted_at,
+        )
+    except Exception as exc:
+        print(f"[AI Worker Fatal] user={user_id} group={is_group} error={type(exc).__name__}: {exc}")
+        print(traceback.format_exc(limit=8))
+        fail_text = "❌ هنگام آماده‌سازی پاسخ خطای داخلی رخ داد؛ لطفاً دوباره تلاش کن."
+        if not _edit_processing_ack(chat_id, precreated_status_msg, fail_text):
+            try:
+                bot.send_message(chat_id, fail_text, message_thread_id=thread_id)
+            except Exception as send_exc:
+                print(f"[AI Worker Error Notice Failed] user={user_id}: {type(send_exc).__name__}")
+        if request_id:
+            _CANCEL_REQS.discard(request_id)
+
+
 # ==========================================
 # ۴. پردازش ساخت عکس (استودیوی مستقل تصویرسازی)
 # ==========================================
-def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None, source_message=None):
+def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None, source_message=None, precreated_status_msg=None):
     img_models = get_img_models_cached()
     img_idx_str = safe_kv_get(f"USER_IMG_MODEL_{target_key_id}") or safe_kv_get(f"USER_IMG_MODEL_{user_id}") or "0"
     lang = get_user_lang(user_id)
@@ -2843,7 +3594,9 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         img_idx = 0
 
     if not img_models or img_idx >= len(img_models):
-        bot.send_message(chat_id, "⚠️ هیچ مدل تصویرسازی تعریف نشده است." if lang == "fa" else "⚠️ No image models defined.", message_thread_id=thread_id)
+        warning = "⚠️ هیچ مدل تصویرسازی تعریف نشده است." if lang == "fa" else "⚠️ No image models defined."
+        if not _edit_processing_ack(chat_id, precreated_status_msg, warning):
+            bot.send_message(chat_id, warning, message_thread_id=thread_id)
         return
 
     active_img_model = img_models[img_idx]
@@ -2888,58 +3641,20 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
     cancel_markup = types.InlineKeyboardMarkup()
     cancel_markup.add(types.InlineKeyboardButton(tr(user_id, "cancel_btn"), callback_data=f"cancel_req_{req_id}", style="danger"))
 
-    loading_msg = (f"🖌️ در حال ویرایش عکس با {active_img_model.get('name')}... ⏱️ 00:00" if source_image_bytes else f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ 00:00") if lang == "fa" else (f"🖌️ Editing image with {active_img_model.get('name')}... ⏱️ 00:00" if source_image_bytes else f"🎨 Generating image with {active_img_model.get('name')}... ⏱️ 00:00")
-    status_msg = bot.send_message(
-        chat_id,
-        loading_msg,
-        reply_markup=cancel_markup,
-        message_thread_id=thread_id
-    )
+    loading_msg = (f"🖌️ در حال ویرایش عکس با {active_img_model.get('name')}..." if source_image_bytes else f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}...") if lang == "fa" else (f"🖌️ Editing image with {active_img_model.get('name')}..." if source_image_bytes else f"🎨 Generating image with {active_img_model.get('name')}...")
+    if precreated_status_msg is not None:
+        _edit_processing_ack(chat_id, precreated_status_msg, loading_msg, reply_markup=cancel_markup)
+        status_msg = precreated_status_msg
+    else:
+        status_msg = bot.send_message(
+            chat_id,
+            loading_msg,
+            reply_markup=cancel_markup,
+            message_thread_id=thread_id
+        )
     status_msg_id = status_msg.message_id
-    is_done = False
     image_data = None
     error_msg = None
-    start_time = time.time()
-
-    def timer_loop():
-        last_edit_time = 0
-        edit_interval = 1.5
-
-        while not is_done:
-            time.sleep(0.5)
-            if is_done or (req_id in _CANCEL_REQS):
-                break
-
-            now = time.time()
-            elapsed = int(now - start_time)
-            if elapsed >= 2100:
-                break
-
-            if now - last_edit_time >= edit_interval:
-                mins = elapsed // 60
-                secs = elapsed % 60
-                time_display = f"{mins:02d}:{secs:02d}"
-                cur_text = (f"🖌️ در حال ویرایش عکس با {active_img_model.get('name')}... ⏱️ {time_display}" if source_image_bytes else f"🎨 در حال ساخت تصویر با {active_img_model.get('name')}... ⏱️ {time_display}") if lang == "fa" else (f"🖌️ Editing image with {active_img_model.get('name')}... ⏱️ {time_display}" if source_image_bytes else f"🎨 Generating image with {active_img_model.get('name')}... ⏱️ {time_display}")
-                try:
-                    bot.edit_message_text(
-                        cur_text,
-                        chat_id=chat_id,
-                        message_id=status_msg_id,
-                        reply_markup=cancel_markup
-                    )
-                    last_edit_time = now
-                except ApiTelegramException as te:
-                    if te.error_code == 429:
-                        wait_time = te.result_json.get('parameters', {}).get('retry_after', 3)
-                        last_edit_time = now + wait_time
-                    elif "message is not modified" in str(te).lower():
-                        last_edit_time = now
-                    else:
-                        last_edit_time = now + 1
-                except Exception:
-                    last_edit_time = now + 1
-
-    threading.Thread(target=timer_loop, daemon=True).start()
 
     try:
         base_url = active_img_model.get("baseUrl", "").strip().rstrip("/")
@@ -2972,7 +3687,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                     headers=edit_headers,
                     files={"image": ("input.jpg", source_image_bytes, "image/jpeg")},
                     data={"prompt": edit_prompt, "output_format": "png"},
-                    timeout=(60, 2100),
+                    timeout=(60, API_TIMEOUT_SECONDS),
                 )
                 if req_id in _CANCEL_REQS:
                     return
@@ -3028,7 +3743,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                         headers=edit_headers,
                         data=edit_data,
                         files={"image": ("input.jpg", source_image_bytes, "image/jpeg")},
-                        timeout=(60, 2100),
+                        timeout=(60, API_TIMEOUT_SECONDS),
                     )
                     if req_id in _CANCEL_REQS:
                         return
@@ -3052,7 +3767,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                         job_id = edit_json.get("id") if isinstance(edit_json, dict) else None
                         if not image_data and job_id:
                             poll_url = f"{poll_base}/{job_id}"
-                            deadline = time.time() + 300
+                            deadline = time.time() + API_TIMEOUT_SECONDS
                             poll_interval = 2.0
 
                             while time.time() < deadline:
@@ -3128,7 +3843,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                     headers=edit_headers,
                     data=edit_data,
                     files={field_name: ("input.jpg", source_image_bytes, "image/jpeg")},
-                    timeout=(60, 2100),
+                    timeout=(60, API_TIMEOUT_SECONDS),
                 )
                 if req_id in _CANCEL_REQS:
                     return
@@ -3140,7 +3855,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                         headers=edit_headers,
                         data=edit_data,
                         files={alt_name: ("input.jpg", source_image_bytes, "image/jpeg")},
-                        timeout=(60, 2100),
+                        timeout=(60, API_TIMEOUT_SECONDS),
                     )
                 if edit_res.status_code == 200:
                     try:
@@ -3169,7 +3884,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 headers=headers,
                 files={"none": ''},
                 data={"prompt": prompt_text, "output_format": "webp"},
-                timeout=(60, 2100)
+                timeout=(60, API_TIMEOUT_SECONDS)
             )
             if req_id in _CANCEL_REQS:
                 return
@@ -3201,7 +3916,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                 headers["Authorization"] = f"Bearer {api_key}"
 
             payload = {"model": model_name, "prompt": prompt_text, "n": 1, "size": "1024x1024"}
-            res = http_session.post(endpoint, headers=headers, json=payload, timeout=(60, 2100))
+            res = http_session.post(endpoint, headers=headers, json=payload, timeout=(60, API_TIMEOUT_SECONDS))
             if req_id in _CANCEL_REQS:
                 return
             
@@ -3224,7 +3939,7 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                     error_msg = f"Job ID missing in response:\n{res.text[:200]}"
                 else:
                     poll_url = f"{endpoint.rstrip('/')}/{job_id}"
-                    deadline = time.time() + 300
+                    deadline = time.time() + API_TIMEOUT_SECONDS
                     poll_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                     poll_interval = 2.0
 
@@ -3273,8 +3988,6 @@ def worker_image_process(chat_id, user_id, prompt_text, target_key_id, thread_id
 
     except Exception as e:
         error_msg = str(e)
-    finally:
-        is_done = True
 
     if req_id in _CANCEL_REQS:
         _CANCEL_REQS.discard(req_id)
@@ -3390,7 +4103,7 @@ def _status_url_for_video_model(model, endpoint, job_id):
     return endpoint.rstrip("/") + "/" + urllib.parse.quote(str(job_id), safe="")
 
 
-def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None):
+def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id=None, precreated_status_msg=None):
     lang = get_user_lang(user_id)
     models = get_video_models_cached()
     try:
@@ -3398,7 +4111,9 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
     except (TypeError, ValueError):
         idx = 0
     if not models or idx < 0 or idx >= len(models):
-        bot.send_message(chat_id, "⚠️ هنوز مدل ساخت ویدیویی تعریف نشده است. از ادمین بخواه یک مدل ویدیو اضافه کند." if lang == "fa" else "⚠️ No video models are configured. Ask the admin to add one.", message_thread_id=thread_id)
+        warning = "⚠️ هنوز مدل ساخت ویدیویی تعریف نشده است. از ادمین بخواه یک مدل ویدیو اضافه کند." if lang == "fa" else "⚠️ No video models are configured. Ask the admin to add one."
+        if not _edit_processing_ack(chat_id, precreated_status_msg, warning):
+            bot.send_message(chat_id, warning, message_thread_id=thread_id)
         return
 
     model = models[idx]
@@ -3412,16 +4127,20 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         if site_url.startswith(("https://", "http://")):
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🌐 باز کردن سایت ساخت ویدیو", url=site_url))
-            bot.send_message(chat_id,
-                ("این مدل فقط آدرس سایت دارد؛ برای ساخت ویدیو داخل خود ربات باید endpoint مستند API هم وارد شود. فعلاً می‌توانی سایت را باز کنی." if lang == "fa" else
-                 "This model has a website URL only. To generate videos inside Telegram, configure its documented API endpoint. You can open the website for now."),
-                reply_markup=markup, message_thread_id=thread_id)
+            note = ("این مدل فقط آدرس سایت دارد؛ برای ساخت ویدیو داخل خود ربات باید endpoint مستند API هم وارد شود. فعلاً می‌توانی سایت را باز کنی." if lang == "fa" else
+                    "This model has a website URL only. To generate videos inside Telegram, configure its documented API endpoint. You can open the website for now.")
+            if not _edit_processing_ack(chat_id, precreated_status_msg, note, reply_markup=markup):
+                bot.send_message(chat_id, note, reply_markup=markup, message_thread_id=thread_id)
         else:
-            bot.send_message(chat_id, "❌ برای این مدل Base URL/Endpoint API تنظیم نشده است.", message_thread_id=thread_id)
+            note = "❌ برای این مدل Base URL/Endpoint API تنظیم نشده است."
+            if not _edit_processing_ack(chat_id, precreated_status_msg, note):
+                bot.send_message(chat_id, note, message_thread_id=thread_id)
         return
 
     if not prompt_text or not prompt_text.strip():
-        bot.send_message(chat_id, "لطفاً توضیح ویدیویی که می‌خواهی ساخته شود را بنویس.", message_thread_id=thread_id)
+        note = "لطفاً توضیح ویدیویی که می‌خواهی ساخته شود را بنویس."
+        if not _edit_processing_ack(chat_id, precreated_status_msg, note):
+            bot.send_message(chat_id, note, message_thread_id=thread_id)
         return
 
     endpoint = _video_generation_endpoint(base_url)
@@ -3433,34 +4152,15 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
     req_id = f"{user_id}_video_{int(time.time() * 1000)}"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(tr(user_id, "cancel_btn"), callback_data=f"cancel_req_{req_id}", style="danger"))
-    status_msg = bot.send_message(
-        chat_id,
-        (f"🎬 درخواست ساخت ویدیو با {model_name} ثبت شد؛ در حال پردازش... ⏱️ 00:00" if lang == "fa" else f"🎬 Video generation with {model_name} is processing... ⏱️ 00:00"),
-        reply_markup=markup, message_thread_id=thread_id
-    )
-    start_time = time.time()
-    is_done = False
+    loading_text = (f"🎬 درخواست ساخت ویدیو با {model_name} ثبت شد؛ در حال پردازش..." if lang == "fa" else f"🎬 Video generation with {model_name} is processing...")
+    if precreated_status_msg is not None:
+        _edit_processing_ack(chat_id, precreated_status_msg, loading_text, reply_markup=markup)
+        status_msg = precreated_status_msg
+    else:
+        status_msg = bot.send_message(chat_id, loading_text, reply_markup=markup, message_thread_id=thread_id)
     video_url = None
     video_bytes = None
     error_msg = None
-
-    def timer_loop():
-        last_edit = 0
-        while not is_done and req_id not in _CANCEL_REQS:
-            time.sleep(1)
-            elapsed = int(time.time() - start_time)
-            if elapsed > 900:
-                break
-            if time.time() - last_edit >= 5:
-                mins, secs = divmod(elapsed, 60)
-                text = (f"🎬 در حال ساخت ویدیو با {model_name}... ⏱️ {mins:02d}:{secs:02d}" if lang == "fa" else f"🎬 Generating video with {model_name}... ⏱️ {mins:02d}:{secs:02d}")
-                try:
-                    bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, reply_markup=markup)
-                except Exception:
-                    pass
-                last_edit = time.time()
-
-    threading.Thread(target=timer_loop, daemon=True).start()
     try:
         headers = {"Accept": "application/json, video/*", "Connection": "keep-alive"}
         if api_key:
@@ -3471,7 +4171,7 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
 
         # This common JSON/job adapter covers APIs that accept prompt/model JSON and return a URL or a job ID.
         # APIs with proprietary payloads require a provider-specific adapter; a webpage URL is not an API.
-        response = http_session.post(endpoint, headers=headers, json=payload, timeout=(30, 240))
+        response = http_session.post(endpoint, headers=headers, json=payload, timeout=(30, API_TIMEOUT_SECONDS))
         if req_id in _CANCEL_REQS:
             return
         content_type = str(response.headers.get("content-type", "")).lower()
@@ -3494,7 +4194,7 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                     status_val = str(result.get("status", "") if isinstance(result, dict) else "").lower()
                     if job_id and (response.status_code == 202 or status_val in {"queued", "pending", "processing", "in_progress", "running", "starting"} or not video_url):
                         poll_url = _status_url_for_video_model(model, endpoint, job_id)
-                        deadline = time.time() + 600
+                        deadline = time.time() + API_TIMEOUT_SECONDS
                         interval = 3.0
                         while time.time() < deadline:
                             if req_id in _CANCEL_REQS:
@@ -3540,7 +4240,7 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
                                 break
                             interval = min(interval * 1.25, 10.0)
                         if not video_url and not video_bytes and not error_msg:
-                            error_msg = "مهلت انتظار برای ساخت ویدیو به پایان رسید (۱۰ دقیقه)."
+                            error_msg = "مهلت انتظار برای ساخت ویدیو به پایان رسید (۱ ساعت)."
                     else:
                         detail = result.get("error") or result.get("message") or result if isinstance(result, dict) else response.text
                         if isinstance(detail, dict):
@@ -3577,8 +4277,6 @@ def worker_video_process(chat_id, user_id, prompt_text, target_key_id, thread_id
         error_msg = f"خطای شبکه هنگام اتصال به API ویدیو: {str(exc)[:500]}"
     except Exception as exc:
         error_msg = f"خطای پردازش ویدیو: {str(exc)[:500]}"
-    finally:
-        is_done = True
 
     if req_id in _CANCEL_REQS:
         _CANCEL_REQS.discard(req_id)
@@ -3638,12 +4336,7 @@ def handle_start_command(msg):
     thread_id = getattr(msg, 'message_thread_id', None) if getattr(msg, 'is_topic_message', False) else None
 
     if not is_bot_globally_active() and user_id != ADMIN_ID:
-        bot.send_message(
-            chat_id,
-            "⚠️ **ربات موقتاً توسط مدیریت خاموش و در دست به‌روزرسانی می‌باشد.**\nلطفاً ساعاتی دیگر مراجعه کنید. 🙏",
-            parse_mode="Markdown",
-            message_thread_id=thread_id
-        )
+        notify_bot_disabled_once(chat_id, thread_id)
         return
 
     track_user_activity(user_id, first_name, username)
@@ -3679,6 +4372,7 @@ def handle_start_command(msg):
 # ==========================================
 @bot.message_handler(content_types=['text', 'photo', 'document', 'video', 'audio', 'voice', 'sticker'])
 def handle_all_messages(msg):
+    handler_received_at = time.monotonic()
     if not msg.from_user:
         return
 
@@ -3692,14 +4386,58 @@ def handle_all_messages(msg):
     is_group = msg.chat.type in ["group", "supergroup"]
     thread_id = getattr(msg, 'message_thread_id', None) if getattr(msg, 'is_topic_message', False) else None
     target_key_id = f"group_{chat_id}" if is_group else user_id
+    pre_ack_msg = None
+    keyboard_labels = {"📋 منوی اصلی", "📋 Main Menu", "📜 تاریخچه گفتگوها", "📜 Chat History", "⚙️ مدیریت ربات", "⚙️ Admin Panel"}
+    # Only private-chat messages may receive a generic early acknowledgement.
+    # In groups, an acknowledgement is allowed exclusively after an explicit bot
+    # invocation (prefix/@mention) or a reply to this bot. Otherwise, replying to
+    # an ordinary user's message must stay silent and must not leave a stuck status.
+    plain_private_candidate = (
+        not is_group
+        and bool(msg.text)
+        and not command_text.startswith("/")
+        and command_text not in keyboard_labels
+    )
+
+    # For group calls, only acknowledge messages that really look like a call/reply to this bot.
+    early_group_call = False
+    early_invoked = False
+    if is_group and bool(msg.text):
+        cached_bot_username = str(getattr(_BOT_INFO_CACHE, "username", "") or "")
+        early_invoked, _early_prompt = extract_group_invocation(command_text, cached_bot_username)
+        reply_from_user = getattr(getattr(msg, "reply_to_message", None), "from_user", None)
+        token_bot_id = BOT_TOKEN.split(":", 1)[0] if ":" in BOT_TOKEN else ""
+        is_early_reply_to_bot = bool(reply_from_user and (
+            str(getattr(reply_from_user, "id", "")) == str(token_bot_id) and token_bot_id.isdigit()
+            or (cached_bot_username and str(getattr(reply_from_user, "username", "") or "").lower() == cached_bot_username.lower())
+        ))
+        is_early_bot_control = bool(re.match(
+            r"^(?:/bot|ربات|روبات|بات|نئو|نعو)\s*(?:صحبت|حرف\s*بزن|فعال|روشن|سکوت|بی\s*صدا|ساکت|خاموش)$",
+            command_text, flags=re.IGNORECASE
+        ))
+        is_early_reply_moderation = bool(msg.reply_to_message and reply_from_user and not is_early_reply_to_bot and re.match(
+            r"^(?:نئو|نعو|neo|tenet|ربات|روبات|بات)?\s*(?:سکوت|بی\s*صدا|بیصدا|ساکت|اخراج|بن|مسدود|حذف|پاک|رفع سکوت|رفع بی\s*صدا|/mute|/ban|/kick|/del|/delete)",
+            command_text, flags=re.IGNORECASE
+        ))
+        early_group_call = (early_invoked or is_early_reply_to_bot) and not is_early_bot_control and not is_early_reply_moderation
+
+    should_fast_ack = (plain_private_candidate and user_id != ADMIN_ID) or early_group_call
+    # Don't create an acknowledgement while an explicitly-disabled bot is already known to be off.
+    if should_fast_ack and _BOT_STATUS_CACHE is not False:
+        # Use one stable status label. It is upgraded with a cancel button at queue submission.
+        early_text = "💬 در حال فکر کردن..."
+        pre_ack_msg = _send_processing_ack(
+            chat_id, early_text, thread_id=thread_id,
+            reply_to_message_id=(msg.message_id if is_group else None),
+        )
 
     if not is_bot_globally_active() and user_id != ADMIN_ID:
-        bot.send_message(
-            chat_id,
-            "⚠️ **ربات موقتاً توسط مدیریت خاموش است.**",
-            parse_mode="Markdown",
-            message_thread_id=thread_id
-        )
+        if pre_ack_msg is not None:
+            if not _edit_processing_ack(chat_id, pre_ack_msg, "⚠️ ربات موقتاً توسط مدیریت خاموش است.", parse_mode="Markdown"):
+                _delete_processing_ack(chat_id, pre_ack_msg)
+                notify_bot_disabled_once(chat_id, thread_id)
+        else:
+            notify_bot_disabled_once(chat_id, thread_id)
         return
 
     track_user_activity(user_id, first_name, username)
@@ -3822,6 +4560,9 @@ def handle_all_messages(msg):
                 handle_admin_steps(chat_id, user_id, text, admin_step)
                 return
 
+    if pre_ack_msg is None and plain_private_candidate and user_id == ADMIN_ID and _BOT_STATUS_CACHE is not False:
+        pre_ack_msg = _send_processing_ack(chat_id, "💬 در حال فکر کردن...", thread_id=thread_id)
+
     if msg.document:
         doc = msg.document
         exts = ('.js', '.py', '.txt', '.json', '.html', '.css', '.cpp', '.java')
@@ -3834,12 +4575,15 @@ def handle_all_messages(msg):
             except Exception as e:
                 print(f"[Doc Error]: {e}")
 
-    if safe_kv_get(f"BANNED_{user_id}") == "true":
-        bot.send_message(chat_id, "⛔ حساب شما توسط مدیریت مسدود شده است.", message_thread_id=thread_id)
+    if is_user_banned_cached(user_id):
+        banned_text = "⛔ حساب شما توسط مدیریت مسدود شده است."
+        if not _edit_processing_ack(chat_id, pre_ack_msg, banned_text):
+            bot.send_message(chat_id, banned_text, message_thread_id=thread_id)
         return
 
     if not is_group and safe_kv_get(f"USER_SUPPORT_STEP_{user_id}") == "AWAITING_MSG":
         safe_kv_delete(f"USER_SUPPORT_STEP_{user_id}")
+        _edit_processing_ack(chat_id, pre_ack_msg, "📨 پیام شما در حال ارسال به پشتیبانی است...")
         sender_name = msg.from_user.first_name or "کاربر"
         sender_user = f"@{msg.from_user.username}" if msg.from_user.username else "بدون یوزرنیم"
 
@@ -3855,36 +4599,40 @@ def handle_all_messages(msg):
         try:
             bot.send_message(ADMIN_ID, admin_notify, parse_mode="Markdown")
             bot.copy_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=msg.message_id, reply_markup=markup_reply)
-            bot.send_message(chat_id, "✅ پیام شما با موفقیت به پشتیبانی ارسال شد.")
+            if not _edit_processing_ack(chat_id, pre_ack_msg, "✅ پیام شما با موفقیت به پشتیبانی ارسال شد."):
+                bot.send_message(chat_id, "✅ پیام شما با موفقیت به پشتیبانی ارسال شد.")
         except Exception as e:
-            bot.send_message(chat_id, f"❌ خطا در ارسال: {e}")
+            error_text = f"❌ خطا در ارسال: {e}"
+            if not _edit_processing_ack(chat_id, pre_ack_msg, error_text):
+                bot.send_message(chat_id, error_text)
         return
 
     if not is_group:
         ok_sponsor, unjoined = check_sponsor_join(user_id)
         if not ok_sponsor and ADMIN_ID and user_id != ADMIN_ID:
             markup = build_sponsor_markup(user_id, unjoined)
-            bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
+            if not _edit_processing_ack(chat_id, pre_ack_msg, tr(user_id, "sponsor_warn"), reply_markup=markup, parse_mode="Markdown"):
+                bot.send_message(chat_id, tr(user_id, "sponsor_warn"), parse_mode="Markdown", reply_markup=markup)
             return
 
     if (not is_group and safe_kv_get(f"VIDEO_PROMPT_AWAITING_{user_id}") == "true"
             and command_text and not command_text.startswith("/")):
         safe_kv_delete(f"VIDEO_PROMPT_AWAITING_{user_id}")
         if not _submit_bounded(
-            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
-            chat_id, user_id, command_text[:2000], target_key_id, thread_id,
+            _VIDEO_JOB_EXECUTOR, _VIDEO_JOB_SLOTS, worker_video_process,
+            chat_id, user_id, command_text[:2000], target_key_id, thread_id, pre_ack_msg,
         ):
-            _notify_job_queue_full(chat_id, thread_id)
+            _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
         return
 
     if command_lower.startswith("/video") and not is_group:
         pieces = command_text.split(maxsplit=1)
         prompt = pieces[1].strip() if len(pieces) > 1 else ""
         _USER_MODES_CACHE[target_key_id] = "VIDEO"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "VIDEO")
+        _persist_kv_async(f"BOT_MODE_{target_key_id}", "VIDEO")
         if prompt:
             if not _submit_bounded(
-                _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
+                _VIDEO_JOB_EXECUTOR, _VIDEO_JOB_SLOTS, worker_video_process,
                 chat_id, user_id, prompt, target_key_id, thread_id,
             ):
                 _notify_job_queue_full(chat_id, thread_id)
@@ -3906,9 +4654,19 @@ def handle_all_messages(msg):
 
     target_reply_id = msg.message_id
     if is_group:
-        bot_info = get_bot_info_cached()
-        bot_id = str(bot_info.id)
-        bot_username = (bot_info.username or "").lower()
+        # Prefix/reply requests do not need a synchronous Telegram getMe round-trip.
+        # The numeric bot ID is encoded in the token; use cached username for @mentions.
+        token_bot_id = BOT_TOKEN.split(":", 1)[0] if ":" in BOT_TOKEN else ""
+        cached_info = _BOT_INFO_CACHE
+        bot_id = str(getattr(cached_info, "id", "") or token_bot_id)
+        bot_username = str(getattr(cached_info, "username", "") or "").lower()
+        if (not bot_username and not early_invoked and re.search(r"(?<![\w])@[A-Za-z0-9_]{5,}", text or "")):
+            try:
+                bot_info = get_bot_info_cached()
+                bot_id = str(getattr(bot_info, "id", "") or bot_id)
+                bot_username = str(getattr(bot_info, "username", "") or "").lower()
+            except Exception as bot_info_exc:
+                print(f"[Group Invocation Warning] getMe unavailable: {type(bot_info_exc).__name__}")
         clean_text_raw = text.strip()
         lower_text = clean_text_raw.lower()
 
@@ -3916,6 +4674,7 @@ def handle_all_messages(msg):
         if is_bot_unmute_cmd:
             if is_group_admin(chat_id, user_id):
                 safe_kv_delete(f"GROUP_MUTED_{chat_id}")
+                _invalidate_state_flag(("group_muted", str(chat_id)))
                 bot.reply_to(msg, "🔊 **ربات با موفقیت در این گروه فعال شد و از حالت سکوت خارج گردید.**", parse_mode="Markdown")
             else:
                 bot.reply_to(msg, "⛔ این دستور فقط توسط مدیران گروه قابل اجراست.")
@@ -3925,6 +4684,7 @@ def handle_all_messages(msg):
         if is_bot_mute_cmd and not msg.reply_to_message:
             if is_group_admin(chat_id, user_id):
                 safe_kv_put(f"GROUP_MUTED_{chat_id}", "true")
+                _invalidate_state_flag(("group_muted", str(chat_id)))
                 bot.reply_to(msg, "🔇 **ربات در این گروه به حالت سکوت رفت.**\n(جهت فعال‌سازی مجدد، دستور `/bot صحبت` را ارسال کنید)", parse_mode="Markdown")
             else:
                 bot.reply_to(msg, "⛔ این دستور فقط توسط مدیران گروه قابل اجراست.")
@@ -4064,7 +4824,8 @@ def handle_all_messages(msg):
                     bot.reply_to(msg, "❌ **خطا:** ربات دسترسی حذف پیام (Delete Messages) ندارد.")
                 return
 
-        if safe_kv_get(f"GROUP_MUTED_{chat_id}") == "true":
+        if is_group_muted_cached(chat_id):
+            _delete_processing_ack(chat_id, pre_ack_msg)
             return
 
         replied_from_user = getattr(getattr(msg, 'reply_to_message', None), 'from_user', None)
@@ -4082,8 +4843,9 @@ def handle_all_messages(msg):
             if not text:
                 text = "سلام! در خدمتم، چطور می‌تونم کمکت کنم؟" if get_user_lang(user_id) == "fa" else "Hello! How can I help you today?"
 
-        if msg.reply_to_message and str(msg.reply_to_message.from_user.id) != bot_id:
-            target_user = msg.reply_to_message.from_user
+        replied_target_user = getattr(msg.reply_to_message, "from_user", None) if msg.reply_to_message else None
+        if msg.reply_to_message and replied_target_user and str(replied_target_user.id) != bot_id:
+            target_user = replied_target_user
             target_name = target_user.first_name or "کاربر"
             target_reply_id = msg.reply_to_message.message_id
             replied_text = msg.reply_to_message.text or msg.reply_to_message.caption or ""
@@ -4110,7 +4872,7 @@ def handle_all_messages(msg):
         if attached_sizes:
             attached_file_id = attached_sizes[-1].file_id
             if not (text or "").strip():
-                safe_kv_put(pending_photo_key, {"file_id": attached_file_id, "created_at": time.time()}, expiration_ttl=600)
+                _temp_state_put(pending_photo_key, {"file_id": attached_file_id, "created_at": time.time()}, expiration_ttl=600)
                 if active_mode == "IMAGE":
                     bot.send_message(
                         chat_id,
@@ -4120,9 +4882,9 @@ def handle_all_messages(msg):
                     return
             else:
                 # عکس و کپشن در یک پیام هستند؛ pending قبلی نباید اشتباهاً استفاده شود.
-                safe_kv_delete(pending_photo_key)
+                _temp_state_delete(pending_photo_key)
     else:
-        pending_raw = safe_kv_get(pending_photo_key)
+        pending_raw = _temp_state_get(pending_photo_key)
         if pending_raw:
             try:
                 pending_data = json.loads(pending_raw)
@@ -4141,21 +4903,21 @@ def handle_all_messages(msg):
                     ))
                     if active_mode == "IMAGE" or text_looks_like_edit:
                         has_photo_attached = True
-                        safe_kv_delete(pending_photo_key)
+                        _temp_state_delete(pending_photo_key)
                     else:
                         photo_source_for_image = msg
                 else:
-                    safe_kv_delete(pending_photo_key)
+                    _temp_state_delete(pending_photo_key)
             except Exception:
-                safe_kv_delete(pending_photo_key)
+                _temp_state_delete(pending_photo_key)
     
     active_mode = get_user_current_mode(target_key_id)
     if active_mode == "VIDEO" and not has_photo_attached and text.strip():
         if not _submit_bounded(
-            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_video_process,
-            chat_id, user_id, text.strip(), target_key_id, thread_id,
+            _VIDEO_JOB_EXECUTOR, _VIDEO_JOB_SLOTS, worker_video_process,
+            chat_id, user_id, text.strip(), target_key_id, thread_id, pre_ack_msg,
         ):
-            _notify_job_queue_full(chat_id, thread_id)
+            _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
         return
 
     try:
@@ -4175,15 +4937,15 @@ def handle_all_messages(msg):
         text or "", flags=re.IGNORECASE
     ))
     awaiting_img_key = f"AWAITING_IMG_{target_key_id}"
-    awaiting_image_prompt = safe_kv_get(awaiting_img_key) == "true"
+    awaiting_image_prompt = _temp_state_get(awaiting_img_key) == "true"
 
     if awaiting_image_prompt and not has_photo_attached and (text or "").strip():
-        safe_kv_delete(awaiting_img_key)
+        _temp_state_delete(awaiting_img_key)
         is_img_prompt = True
         clean_img_prompt = text.strip()
 
     if bare_image_request and not has_photo_attached:
-        safe_kv_put(awaiting_img_key, "true", expiration_ttl=600)
+        _temp_state_put(awaiting_img_key, "true", expiration_ttl=600)
         ask_prompt = (
             "🎨 حتماً عزیزم! توضیح بده چه عکسی بسازم.\n"
             "مثلاً: «ماه کامل در آسمان شب، سبک واقع‌گرایانه».\n"
@@ -4193,20 +4955,30 @@ def handle_all_messages(msg):
             "For example: “A full moon in the night sky, photorealistic style.”\n"
             "Reply to this message with your prompt."
         )
-        bot.send_message(chat_id, ask_prompt, reply_to_message_id=msg.message_id,
-                         allow_sending_without_reply=True, message_thread_id=thread_id)
+        if not _edit_processing_ack(chat_id, pre_ack_msg, ask_prompt):
+            bot.send_message(chat_id, ask_prompt, reply_to_message_id=msg.message_id,
+                             allow_sending_without_reply=True, message_thread_id=thread_id)
         return
 
     # ۱. تولید کد
     if is_code:
         if not is_group:
             _USER_MODES_CACHE[target_key_id] = "CODE"
-            safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
+            _persist_kv_async(f"BOT_MODE_{target_key_id}", "CODE")
+        group_request = is_group
+        ai_executor = _GROUP_AI_JOB_EXECUTOR if group_request else _AI_JOB_EXECUTOR
+        ai_slots = _GROUP_AI_JOB_SLOTS if group_request else _AI_JOB_SLOTS
+        request_id, pre_ack_msg, submitted_at = _prepare_ai_job_status(
+            chat_id, user_id, pre_ack_msg, thread_id=thread_id,
+            reply_to_message_id=(msg.message_id if is_group else None),
+            received_at=handler_received_at, is_group=is_group,
+        )
         if not _submit_bounded(
-            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_ai_process,
-            chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE",
+            ai_executor, ai_slots, worker_ai_process,
+            chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, "CODE", pre_ack_msg,
+            request_id=request_id, submitted_at=submitted_at,
         ):
-            _notify_job_queue_full(chat_id, thread_id)
+            _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
         return
 
     # ۲. ساخت تصویر یا ویرایش عکسِ پیوست‌شده با همان مدل تصویری انتخاب‌شده
@@ -4217,28 +4989,36 @@ def handle_all_messages(msg):
     if has_photo_attached and (active_mode == "IMAGE" or image_edit_intent):
         img_prompt_to_use = text.strip() or "عکس ورودی را با حفظ جزئیات اصلی ویرایش کن."
         if not _submit_bounded(
-            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_image_process,
-            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id, photo_source_for_image,
+            _IMAGE_JOB_EXECUTOR, _IMAGE_JOB_SLOTS, worker_image_process,
+            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id, photo_source_for_image, pre_ack_msg,
         ):
-            _notify_job_queue_full(chat_id, thread_id)
+            _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
         return
 
     if (active_mode == "IMAGE" or is_img_prompt) and not has_photo_attached:
         img_prompt_to_use = clean_img_prompt if is_img_prompt else text
         if not _submit_bounded(
-            _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_image_process,
-            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id,
+            _IMAGE_JOB_EXECUTOR, _IMAGE_JOB_SLOTS, worker_image_process,
+            chat_id, user_id, img_prompt_to_use, target_key_id, thread_id, None, pre_ack_msg,
         ):
-            _notify_job_queue_full(chat_id, thread_id)
+            _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
         return
 
     # ۳. مکالمه و پرسش و پاسخ
     current_ai_mode = "CODE" if active_mode == "CODE" else "CHAT"
+    ai_executor = _GROUP_AI_JOB_EXECUTOR if is_group else _AI_JOB_EXECUTOR
+    ai_slots = _GROUP_AI_JOB_SLOTS if is_group else _AI_JOB_SLOTS
+    request_id, pre_ack_msg, submitted_at = _prepare_ai_job_status(
+        chat_id, user_id, pre_ack_msg, thread_id=thread_id,
+        reply_to_message_id=(msg.message_id if is_group else None),
+        received_at=handler_received_at, is_group=is_group,
+    )
     if not _submit_bounded(
-        _AI_JOB_EXECUTOR, _AI_JOB_SLOTS, worker_ai_process,
-        chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode,
+        ai_executor, ai_slots, worker_ai_process,
+        chat_id, user_id, msg, text, target_key_id, is_group, target_reply_id, thread_id, current_ai_mode, pre_ack_msg,
+        request_id=request_id, submitted_at=submitted_at,
     ):
-        _notify_job_queue_full(chat_id, thread_id)
+        _notify_job_queue_full(chat_id, thread_id, pre_ack_msg)
 
 # ==========================================
 # ۶. هندلر دکمه‌های شیشه‌ای
@@ -4283,7 +5063,7 @@ def _handle_callbacks_impl(query):
                 pass
             return
         _CANCEL_REQS.add(req_id)
-        safe_kv_put(f"CANCEL_{req_id}", "true", 2100)
+        safe_kv_put(f"CANCEL_{req_id}", "true", API_TIMEOUT_SECONDS)
         try:
             bot.answer_callback_query(query.id, "درخواست متوقف شد.")
             bot.edit_message_text(tr(user_id, "req_canceled"), chat_id=chat_id, message_id=query.message.message_id)
@@ -4341,13 +5121,12 @@ def _handle_callbacks_impl(query):
     # انتخاب مدل‌ها با جابه‌جایی آنی تیک سبز
     if data.startswith("set_model_"):
         idx = data.replace("set_model_", "")
-        safe_kv_put(f"USER_MODEL_{target_key_id}", idx)
-        active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
-        if active_sess:
-            safe_kv_delete(f"HISTORY_{user_id}_{active_sess}")
-
+        _model_selection_set_cached(f"USER_MODEL_{target_key_id}", idx, persist=True)
+        _clear_active_history_async(user_id)
         models = get_ai_models_cached()
         name = models[int(idx)].get("name") if idx.isdigit() and int(idx) < len(models) else "انتخاب شده"
+        if not is_group:
+            _cache_selected_model_display_name(user_id, "CHAT", name)
 
         new_markup = build_model_selection_markup(target_key_id, is_group, models, current_idx=idx, is_code_category=False)
         try:
@@ -4368,8 +5147,10 @@ def _handle_callbacks_impl(query):
         if not idx.isdigit() or int(idx) < 0 or int(idx) >= len(models):
             bot.answer_callback_query(query.id, "مدل برنامه‌نویسی معتبر نیست.", show_alert=True)
             return
-        safe_kv_put(f"USER_CODE_MODEL_{target_key_id}", idx)
+        _model_selection_set_cached(f"USER_CODE_MODEL_{target_key_id}", idx, persist=True)
         name = models[int(idx)].get("name") if idx.isdigit() and int(idx) < len(models) else "انتخاب شده"
+        if not is_group:
+            _cache_selected_model_display_name(user_id, "CODE", name)
 
         new_markup = build_model_selection_markup(target_key_id, is_group, models, current_idx=idx, is_code_category=True)
         try:
@@ -4386,9 +5167,11 @@ def _handle_callbacks_impl(query):
 
     elif data.startswith("set_img_model_"):
         idx = data.replace("set_img_model_", "")
-        safe_kv_put(f"USER_IMG_MODEL_{target_key_id}", idx)
+        _model_selection_set_cached(f"USER_IMG_MODEL_{target_key_id}", idx, persist=True)
         img_models = get_img_models_cached()
         name = img_models[int(idx)].get("name") if idx.isdigit() and int(idx) < len(img_models) else "انتخاب شده"
+        if not is_group:
+            _cache_selected_model_display_name(user_id, "IMAGE", name)
 
         new_markup = build_image_model_selection_markup(target_key_id, is_group, img_models, current_idx=idx)
         try:
@@ -4409,8 +5192,10 @@ def _handle_callbacks_impl(query):
         if not idx.isdigit() or int(idx) < 0 or int(idx) >= len(video_models):
             bot.answer_callback_query(query.id, "مدل ویدیو معتبر نیست.", show_alert=True)
             return
-        safe_kv_put(f"USER_VIDEO_MODEL_{target_key_id}", idx)
+        _model_selection_set_cached(f"USER_VIDEO_MODEL_{target_key_id}", idx, persist=True)
         name = video_models[int(idx)].get("name", "Video model")
+        if not is_group:
+            _cache_selected_model_display_name(user_id, "VIDEO", name)
         new_markup = build_video_model_selection_markup(target_key_id, is_group, video_models, current_idx=idx)
         try:
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=new_markup)
@@ -4583,28 +5368,28 @@ def _handle_callbacks_impl(query):
     if is_group:
         if data == "switch_group_chat":
             _USER_MODES_CACHE[target_key_id] = "CHAT"
-            safe_kv_put(f"BOT_MODE_{target_key_id}", "CHAT")
+            _persist_kv_async(f"BOT_MODE_{target_key_id}", "CHAT")
             send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
             bot.send_message(chat_id, "💬 **حالت ربات در این گروه روی «پرسش و پاسخ و گفتگو» تنظیم شد.**")
             return
 
         elif data == "switch_group_code":
             _USER_MODES_CACHE[target_key_id] = "CODE"
-            safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
+            _persist_kv_async(f"BOT_MODE_{target_key_id}", "CODE")
             send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
             bot.send_message(chat_id, "💻 **حالت ربات در این گروه روی «کدنویسی و توسعه نرم‌افزار» تنظیم شد.**")
             return
 
         elif data == "switch_group_image":
             _USER_MODES_CACHE[target_key_id] = "IMAGE"
-            safe_kv_put(f"BOT_MODE_{target_key_id}", "IMAGE")
+            _persist_kv_async(f"BOT_MODE_{target_key_id}", "IMAGE")
             send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
             bot.send_message(chat_id, "🎨 **حالت ربات در این گروه روی «استودیو ساخت عکس» تنظیم شد.**")
             return
 
         elif data == "switch_group_video":
             _USER_MODES_CACHE[target_key_id] = "VIDEO"
-            safe_kv_put(f"BOT_MODE_{target_key_id}", "VIDEO")
+            _persist_kv_async(f"BOT_MODE_{target_key_id}", "VIDEO")
             send_models_hub(chat_id, target_key_id, is_group=True, message_id=query.message.message_id)
             bot.send_message(chat_id, "🎬 **حالت ساخت ویدیو برای این گروه فعال شد.**")
             return
@@ -4624,25 +5409,25 @@ def _handle_callbacks_impl(query):
 
     elif data == "switch_mode_chat" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "CHAT"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "CHAT")
+        _persist_kv_async(f"BOT_MODE_{target_key_id}", "CHAT")
         refresh_main_menu_banner(chat_id, user_id, query.message.message_id)
         bot.send_message(chat_id, tr(user_id, "chat_mode_msg"), parse_mode="Markdown")
 
     elif data == "switch_mode_code" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "CODE"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "CODE")
+        _persist_kv_async(f"BOT_MODE_{target_key_id}", "CODE")
         refresh_main_menu_banner(chat_id, user_id, query.message.message_id)
         bot.send_message(chat_id, tr(user_id, "code_mode_msg"), parse_mode="Markdown")
 
     elif data == "switch_mode_image" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "IMAGE"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "IMAGE")
+        _persist_kv_async(f"BOT_MODE_{target_key_id}", "IMAGE")
         refresh_main_menu_banner(chat_id, user_id, query.message.message_id)
         bot.send_message(chat_id, tr(user_id, "image_mode_msg"), parse_mode="Markdown")
 
     elif data == "switch_mode_video" and not is_group:
         _USER_MODES_CACHE[target_key_id] = "VIDEO"
-        safe_kv_put(f"BOT_MODE_{target_key_id}", "VIDEO")
+        _persist_kv_async(f"BOT_MODE_{target_key_id}", "VIDEO")
         refresh_main_menu_banner(chat_id, user_id, query.message.message_id)
         bot.send_message(chat_id, tr(user_id, "video_mode_msg"), parse_mode="Markdown")
 
@@ -4759,7 +5544,7 @@ def _handle_callbacks_impl(query):
 
     elif data == "models_cat_chat":
         models = get_ai_models_cached()
-        current_idx = safe_kv_get(f"USER_MODEL_{target_key_id}") or "0"
+        current_idx = _model_selection_get_or_load(f"USER_MODEL_{target_key_id}")
         new_markup = build_model_selection_markup(target_key_id, is_group, models, current_idx, is_code_category=False)
         try:
             bot.edit_message_text("✨ **مدل هوش مصنوعی چت و گفتگو را انتخاب کنید:**", chat_id=chat_id, message_id=query.message.message_id, parse_mode="Markdown", reply_markup=new_markup)
@@ -4768,7 +5553,16 @@ def _handle_callbacks_impl(query):
 
     elif data == "models_cat_code":
         models = get_code_models_cached() or get_ai_models_cached()
-        current_idx = safe_kv_get(f"USER_CODE_MODEL_{target_key_id}") or safe_kv_get(f"USER_MODEL_{target_key_id}") or "0"
+        code_key = f"USER_CODE_MODEL_{target_key_id}"
+        current_idx = _model_selection_get_cached(code_key)
+        if current_idx is None:
+            current_idx = safe_kv_get(code_key)
+            if current_idx is None:
+                current_idx = _model_selection_get_or_load(f"USER_MODEL_{target_key_id}")
+            else:
+                with _MODEL_SELECTION_CACHE_LOCK:
+                    _MODEL_SELECTION_CACHE[code_key] = (time.monotonic(), str(current_idx))
+        current_idx = str(current_idx or "0")
         if current_idx.isdigit() and int(current_idx) >= len(models):
             current_idx = "0"
         new_markup = build_model_selection_markup(target_key_id, is_group, models, current_idx, is_code_category=True)
@@ -4824,6 +5618,7 @@ def _handle_callbacks_impl(query):
         sessions = json.loads(safe_kv_get(f"SESSIONS_{user_id}") or "[]")
         active_sess = safe_kv_get(f"ACTIVE_SESSION_{user_id}")
         safe_kv_delete(f"HISTORY_{user_id}_{del_id}")
+        _history_cache_delete(f"HISTORY_{user_id}_{del_id}")
 
         new_sessions = [s for s in sessions if s.get("id") != del_id]
         safe_kv_put(f"SESSIONS_{user_id}", new_sessions)
@@ -4831,11 +5626,13 @@ def _handle_callbacks_impl(query):
         if active_sess == del_id:
             if new_sessions:
                 safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_sessions[0]["id"])
+                _set_active_session_cache(user_id, new_sessions[0]["id"])
             else:
                 new_sess_id = f"sess_{time.time_ns()}"
                 safe_kv_put(f"ACTIVE_SESSION_{user_id}", new_sess_id)
+                _set_active_session_cache(user_id, new_sess_id)
                 new_sessions = [make_session_record(new_sess_id)]
-                save_sessions_limited(user_id, new_sessions)
+                save_sessions_limited(user_id, new_sessions, active_id=new_sess_id)
         else:
             save_sessions_limited(user_id, new_sessions)
 
@@ -4848,6 +5645,7 @@ def _handle_callbacks_impl(query):
     elif data.startswith("switch_sess_") and not is_group:
         sess_id = data.replace("switch_sess_", "")
         safe_kv_put(f"ACTIVE_SESSION_{user_id}", sess_id)
+        _set_active_session_cache(user_id, sess_id)
         bot.send_message(chat_id, "🔄 با موفقیت به این گفتگو منتقل شدید.")
         send_history_menu(chat_id, user_id, message_id=query.message.message_id)
 
@@ -4963,9 +5761,11 @@ def _handle_callbacks_impl(query):
         is_banned = safe_kv_get(f"BANNED_{target_uid}") == "true"
         if is_banned:
             safe_kv_delete(f"BANNED_{target_uid}")
+            _invalidate_state_flag(("banned", str(target_uid)))
             upstash_command(["SREM", "BANNED_USERS_SET", target_uid])
         else:
             safe_kv_put(f"BANNED_{target_uid}", "true")
+            _invalidate_state_flag(("banned", str(target_uid)))
             upstash_command(["SADD", "BANNED_USERS_SET", target_uid])
         
         send_user_profile_card(chat_id, target_uid, page=page, message_id=query.message.message_id)
@@ -4981,9 +5781,14 @@ def _handle_callbacks_impl(query):
         _KNOWN_USERS_CACHE.discard(target_uid)
         safe_kv_delete(f"USER_INFO_{target_uid}")
         safe_kv_delete(f"BANNED_{target_uid}")
+        _invalidate_state_flag(("banned", str(target_uid)))
         safe_kv_delete(f"LAST_ACTIVE_{target_uid}")
         safe_kv_delete(f"SESSIONS_{target_uid}")
         safe_kv_delete(f"ACTIVE_SESSION_{target_uid}")
+        _set_active_session_cache(target_uid, None)
+        with _CHAT_HISTORY_CACHE_LOCK:
+            for cached_history_key in [key for key in _CHAT_HISTORY_CACHE if key.startswith(f"HISTORY_{target_uid}_")]:
+                _CHAT_HISTORY_CACHE.pop(cached_history_key, None)
         invalidate_users_cache()
         send_admin_users_list(chat_id, page=page, message_id=query.message.message_id)
 
@@ -5100,7 +5905,23 @@ def _handle_callbacks_impl(query):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(query):
-    """Dispatch inline-button callbacks away from the general Telegram update pool."""
+    """Dispatch callbacks off the update pool; acknowledge safe navigation instantly."""
+    # These callbacks only navigate or redraw a screen. Close Telegram's click spinner
+    # before the worker does cache/Redis reads and edits the actual menu message.
+    fast_navigation = {
+        "main_menu", "models_hub", "models_cat_chat", "models_cat_code",
+        "models_cat_image", "models_cat_video", "history_menu", "history_help", "close_menu",
+    }
+    callback_message = getattr(query, "message", None)
+    callback_chat_type = getattr(getattr(callback_message, "chat", None), "type", "")
+    callback_user_id = str(getattr(getattr(query, "from_user", None), "id", ""))
+    if (getattr(query, "data", None) in fast_navigation
+            and callback_chat_type not in ("group", "supergroup")
+            and (_BOT_STATUS_CACHE is True or callback_user_id == ADMIN_ID)):
+        try:
+            bot.answer_callback_query(query.id)
+        except Exception:
+            pass
     try:
         accepted = _submit_bounded(
             _CALLBACK_EXECUTOR, _CALLBACK_SLOTS, _process_callback_query_safely, query
@@ -5522,9 +6343,10 @@ if __name__ == "__main__":
     print("=" * 45)
     print("🤖 Neo-AI-Bot (Ultra-Fast Tech & Model Editor Engine) Started")
     print("⚡ Connected to Upstash Redis REST Database")
-    print("⏱️ Max Timeout: 35 Minutes | Instant UI Checkmarks Active")
-    print(f"🧵 Telegram handlers: {TELEGRAM_HANDLER_THREADS} | Callback workers: {CALLBACK_WORKERS}")
-    print(f"⚙️ AI workers: {AI_JOB_WORKERS} | Pending job limit: {AI_JOB_QUEUE_LIMIT}")
+    print(f"API read timeout: {API_TIMEOUT_SECONDS // 60} minutes | Static processing status | Fast UI caches active")
+    print(f"🧵 Telegram handlers: {TELEGRAM_HANDLER_THREADS} | Callback workers: {CALLBACK_WORKERS}+{CALLBACK_QUEUE_LIMIT}")
+    print(f"⚙️ Chat/Code workers: {AI_JOB_WORKERS}+{AI_JOB_QUEUE_LIMIT} | Group workers: {GROUP_AI_JOB_WORKERS}+{GROUP_AI_JOB_QUEUE_LIMIT}")
+    print(f"🎨 Image workers: {IMAGE_JOB_WORKERS}+{IMAGE_JOB_QUEUE_LIMIT} | 🎬 Video workers: {VIDEO_JOB_WORKERS}+{VIDEO_JOB_QUEUE_LIMIT}")
     print("🚀 Instant /start Enabled (< 0.2s)")
     print("🌐 Bilingual Support Active (FA / EN)")
     print("🛠 Full Model Editing & Vision Toggling Enabled")
@@ -5536,7 +6358,22 @@ if __name__ == "__main__":
     try:
         bot.remove_webhook()
     except Exception as e:
-        print(f"[Webhook Removal]: {e}")
+        print(f"[Webhook Removal]: {type(e).__name__}")
+
+    # Warm quick-read caches before polling so the first real request is not delayed by preflight GETs.
+    try:
+        is_bot_globally_active()
+    except Exception as exc:
+        print(f"[Startup Status Cache Warning]: {type(exc).__name__}")
+    try:
+        get_bot_info_cached(force_refresh=True)
+    except Exception as exc:
+        print(f"[Startup getMe Cache Warning]: {type(exc).__name__}")
+    try:
+        warm_counts = warm_model_registry_cache()
+        print("[Startup Model Cache] " + ", ".join(f"{key}={count}" for key, count in warm_counts.items()))
+    except Exception as exc:
+        print(f"[Startup Model Cache Warning]: {type(exc).__name__}")
 
     while True:
         try:
