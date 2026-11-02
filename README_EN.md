@@ -78,6 +78,40 @@ Open `/start` in a private chat and use the Admin Panel. Enter the endpoint, API
 
 Moderation commands require suitable group-admin status and Telegram permissions for the bot.
 
+## 🆕 Menu and Conversation Experience Improvements
+
+### Glass Menu and Persistent Reply Keyboard
+
+- The main options available in the glass menu are also accessible through the persistent keyboard at the bottom of the chat. The displayed options follow the user's or administrator's access level.
+- A dedicated **Glass Menu** button opens the glass menu. The bottom reply keyboard and the glass menu remain separate ways to navigate the bot.
+- The **Main Menu** action in the bottom keyboard has been adjusted so users can return from a submenu without getting stuck.
+- Sending `/start` again displays the menu and keyboard again, including after a Telegram conversation has been cleared and the user starts the bot again.
+
+### AI Responses and Request Cancellation
+
+- While an AI request is being processed, a **Cancel Request** button is shown so the running request can be stopped.
+- After the final AI response is ready, it is sent without an administrator or user control keyboard attached beneath it.
+- The glass menu and bottom keyboard remain independently accessible; navigation controls are not mixed into the AI response message.
+
+### Configurable System Prompts
+
+Administrators can configure model behavior instructions from the chat-model information/edit section:
+
+- **`CHAT`**: a shared instruction set for chat-mode models.
+- **`CODE`**: a shared instruction set for coding-mode models and programming responses.
+- System Prompt text is stored in **Upstash Redis** and persists across bot restarts.
+- The maximum System Prompt length is **8,000 characters**.
+- Send a single period (`.`) in the corresponding input to clear the current prompt.
+- A System Prompt guides the model's tone, style, and response behavior. It does not independently add tools, internet access, or new technical capabilities.
+
+### Persian Context-Aware Reactions
+
+Message reactions take more account of the meaning and tone of Persian sentences. For example, an angry statement should not receive an approving reaction merely because it contains a seemingly positive word, and sarcastic or humorous wording should be distinguished from a genuinely serious or positive statement.
+
+### Group Call Aliases
+
+In addition to the group-call examples listed in the group commands section, `neo-` and `نعو` are included as bot call aliases. Replies still depend on the group's settings, Telegram Privacy Mode, and the bot's access to messages.
+
 ## Security
 
 Do not commit Telegram tokens, Redis credentials, or provider API keys. Store credentials in your host's secret/environment settings. User history and settings are persisted in Upstash Redis, so deploy only with an appropriate data-retention policy.
